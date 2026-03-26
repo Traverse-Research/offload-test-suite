@@ -131,8 +131,10 @@ struct TextureCreateDesc {
   uint32_t Width;
   uint32_t Height;
   uint32_t MipLevels;
-  // Optimized clear value, expected only for render target or depth/stencil
-  // textures. Provides a performance hint to the driver.
+  // Clear value for render target or depth/stencil textures. 
+  // How and when this is applied depends on the backend: 
+  // - DX uses it as an optimized clear hint at resource creation time
+  // - VK and MTL apply it at render pass begin (TODO)
   std::optional<ClearValue> OptimizedClearValue;
 };
 
