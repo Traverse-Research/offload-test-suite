@@ -55,8 +55,25 @@ protected:
 };
 
 class Queue {
+  llvm::SmallVector<std::unique_ptr<CommandBuffer>> PendingCBs;
+
 public:
   virtual ~Queue() = 0;
+  Queue(const Queue &) = delete;
+  Queue &operator=(const Queue &) = delete;
+  Queue(Queue &&) = default;
+  Queue &operator=(Queue &&) = default;
+
+  void submit(std::unique_ptr<CommandBuffer> CB) {
+    PendingCBs.push_back(std::move(CB));
+  }
+
+  void drainPendingCBs() {
+    // TODO: Check fences before clearing.
+    PendingCBs.clear();
+  }
+
+  void waitForIdle() { drainPendingCBs(); }
 
   /// Submit command buffers for execution and block until completion.
   /// Command buffers execute in array order, but dependencies between them
