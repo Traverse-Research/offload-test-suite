@@ -65,13 +65,6 @@ public:
   virtual llvm::Expected<std::shared_ptr<Texture>>
   createTexture(std::string Name, TextureCreateDesc &Desc) = 0;
 
-  // Creates a render target texture from a CPUBuffer description.
-  // TODO / WIP Refactoring: 
-  // For now, Backends should call this and
-  // then create their own readback buffer separately.
-  llvm::Expected<std::shared_ptr<Texture>>
-  createRenderTarget(const CPUBuffer &Buf);
-
   virtual void printExtra(llvm::raw_ostream &OS) {}
 
   virtual ~Device() = 0;
@@ -91,6 +84,12 @@ initializeMetalDevices(const DeviceConfig Config,
                        llvm::SmallVectorImpl<std::unique_ptr<Device>> &Devices);
 llvm::Expected<llvm::SmallVector<std::unique_ptr<Device>>>
 initializeDevices(const DeviceConfig Config);
+
+// Creates a render target texture using the format and dimensions from a
+// CPUBuffer. Does not upload the buffer's data — only uses its description to
+// configure the texture.
+llvm::Expected<std::shared_ptr<Texture>>
+createRenderTarget(Device &Dev, const CPUBuffer &Buf);
 
 } // namespace offloadtest
 

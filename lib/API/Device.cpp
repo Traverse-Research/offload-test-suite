@@ -47,7 +47,7 @@ offloadtest::initializeDevices(const DeviceConfig Config) {
 }
 
 llvm::Expected<std::shared_ptr<Texture>>
-Device::createRenderTarget(const CPUBuffer &Buf) {
+offloadtest::createRenderTarget(Device &Dev, const CPUBuffer &Buf) {
   auto TexFmtOrErr = toTextureFormat(Buf.Format, Buf.Channels);
   if (!TexFmtOrErr)
     return TexFmtOrErr.takeError();
@@ -61,5 +61,5 @@ Device::createRenderTarget(const CPUBuffer &Buf) {
   Desc.MipLevels = 1;
   Desc.OptimizedClearValue = ClearColor{};
 
-  return createTexture("RenderTarget", Desc);
+  return Dev.createTexture("RenderTarget", Desc);
 }
