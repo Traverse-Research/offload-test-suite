@@ -45,3 +45,21 @@ offloadtest::initializeDevices(const DeviceConfig Config) {
 
   return Devices;
 }
+
+llvm::Expected<std::shared_ptr<Texture>>
+Device::createRenderTarget(const CPUBuffer &Buf) {
+  auto TexFmtOrErr = toTextureFormat(Buf.Format, Buf.Channels);
+  if (!TexFmtOrErr)
+    return TexFmtOrErr.takeError();
+
+  TextureCreateDesc Desc = {};
+  Desc.Location = MemoryLocation::GpuOnly;
+  Desc.Usage = TextureUsage::RenderTarget;
+  Desc.Format = *TexFmtOrErr;
+  Desc.Width = Buf.OutputProps.Width;
+  Desc.Height = Buf.OutputProps.Height;
+  Desc.MipLevels = 1;
+  Desc.OptimizedClearValue = ClearColor{};
+
+  return createTexture("RenderTarget", Desc);
+}
