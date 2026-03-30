@@ -63,7 +63,7 @@ public:
                size_t SizeInBytes) = 0;
 
   virtual llvm::Expected<std::shared_ptr<Texture>>
-  createTexture(llvm::StringRef Name, TextureCreateDesc &Desc) = 0;
+  createTexture(std::string Name, TextureCreateDesc &Desc) = 0;
 
   virtual void printExtra(llvm::raw_ostream &OS) {}
 

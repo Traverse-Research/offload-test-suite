@@ -404,7 +404,7 @@ public:
   }
 
   llvm::Expected<std::shared_ptr<offloadtest::Texture>>
-  createTexture(llvm::StringRef Name, TextureCreateDesc &Desc) override {
+  createTexture(std::string Name, TextureCreateDesc &Desc) override {
     if (!isValidTextureUsageAndFormat(Desc.Usage, Desc.Format))
       return llvm::createStringError(
           std::errc::invalid_argument,

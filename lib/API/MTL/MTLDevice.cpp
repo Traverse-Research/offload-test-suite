@@ -592,7 +592,7 @@ public:
   }
 
   llvm::Expected<std::shared_ptr<offloadtest::Texture>>
-  createTexture(llvm::StringRef Name, TextureCreateDesc &Desc) override {
+  createTexture(std::string Name, TextureCreateDesc &Desc) override {
     if (!isValidTextureUsageAndFormat(Desc.Usage, Desc.Format))
       return llvm::createStringError(
           std::errc::invalid_argument,
@@ -601,10 +601,9 @@ public:
           getTextureUsageName(Desc.Usage).c_str(),
           getTextureFormatName(Desc.Format).data());
 
-    MTL::TextureDescriptor *TDesc =
-        MTL::TextureDescriptor::texture2DDescriptor(
-            getMetalFormat(Desc.Format), Desc.Width, Desc.Height,
-            Desc.MipLevels > 1);
+    MTL::TextureDescriptor *TDesc = MTL::TextureDescriptor::texture2DDescriptor(
+        getMetalFormat(Desc.Format), Desc.Width, Desc.Height,
+        Desc.MipLevels > 1);
     TDesc->setMipmapLevelCount(Desc.MipLevels);
     TDesc->setStorageMode(getMetalStorageMode(Desc.Location));
     TDesc->setUsage(getMetalTextureUsage(Desc.Usage));
