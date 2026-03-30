@@ -98,8 +98,9 @@ public:
 #endif
 };
 
-// Creates a render target texture from a CPUBuffer description.
-// This is test framework logic, not part of the rendering API.
+// Creates a render target texture using the format and dimensions from a
+// CPUBuffer. Does not upload the buffer's data — only uses its description to
+// configure the texture.
 llvm::Expected<std::shared_ptr<Texture>>
 createRenderTarget(Device &Dev, const CPUBuffer &Buf);
 
