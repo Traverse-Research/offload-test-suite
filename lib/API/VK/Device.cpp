@@ -1054,7 +1054,7 @@ public:
           "No render target bound for graphics pipeline.");
     const CPUBuffer &RTBuf = *P.Bindings.RTargetBufferPtr;
 
-    auto TexOrErr = Device::createRenderTarget(RTBuf);
+    auto TexOrErr = offloadtest::createRenderTarget(*this, RTBuf);
     if (!TexOrErr)
       return TexOrErr.takeError();
 

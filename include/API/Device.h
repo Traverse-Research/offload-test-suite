@@ -65,13 +65,6 @@ public:
   virtual llvm::Expected<std::shared_ptr<Texture>>
   createTexture(std::string Name, TextureCreateDesc &Desc) = 0;
 
-  // Creates a render target texture from a CPUBuffer description.
-  // TODO / WIP Refactoring: 
-  // For now, Backends should call this and
-  // then create their own readback buffer separately.
-  llvm::Expected<std::shared_ptr<Texture>>
-  createRenderTarget(const CPUBuffer &Buf);
-
   virtual void printExtra(llvm::raw_ostream &OS) {}
 
   virtual ~Device() = 0;
@@ -104,6 +97,11 @@ public:
   static llvm::Error initializeMtlDevices(const DeviceConfig Config);
 #endif
 };
+
+// Creates a render target texture from a CPUBuffer description.
+// This is test framework logic, not part of the rendering API.
+llvm::Expected<std::shared_ptr<Texture>>
+createRenderTarget(Device &Dev, const CPUBuffer &Buf);
 
 } // namespace offloadtest
 
