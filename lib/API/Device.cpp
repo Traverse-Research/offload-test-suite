@@ -87,7 +87,7 @@ Device::DeviceIterator Device::begin() {
 Device::DeviceIterator Device::end() { return DeviceContext::instance().end(); }
 
 llvm::Expected<std::shared_ptr<Texture>>
-createRenderTarget(Device &Dev, const CPUBuffer &Buf) {
+offloadtest::createRenderTarget(Device &Dev, const CPUBuffer &Buf) {
   auto TexFmtOrErr = toTextureFormat(Buf.Format, Buf.Channels);
   if (!TexFmtOrErr)
     return TexFmtOrErr.takeError();
