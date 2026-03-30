@@ -2119,8 +2119,10 @@ public:
       copyResourceDataToDevice(IS, R);
 
     if (P.isGraphics()) {
+      const auto &CV =
+          std::get<ClearColor>(*IS.RenderTarget->Desc.OptimizedClearValue);
       VkClearValue ClearValues[2] = {};
-      ClearValues[0].color = {{0.0f, 0.0f, 0.0f, 0.0f}};
+      ClearValues[0].color = {{CV.R, CV.G, CV.B, CV.A}};
       ClearValues[1].depthStencil = {1.0f, 0};
 
       VkRenderPassBeginInfo RenderPassBeginInfo = {};
