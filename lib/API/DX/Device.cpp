@@ -394,22 +394,36 @@ public:
 
 class DXQueue : public offloadtest::Queue {
 public:
-  ComPtr<ID3D12CommandQueue> Queue;
+  using Queue::submit;
 
-  DXQueue(ComPtr<ID3D12CommandQueue> Queue) : Queue(Queue) {}
-  virtual ~DXQueue() {}
+  ComPtr<ID3D12CommandQueue> Queue;
+  std::unique_ptr<DXFence> SubmitFence;
+  uint64_t FenceCounter = 0;
+
+  DXQueue(ComPtr<ID3D12CommandQueue> Queue,
+          std::unique_ptr<DXFence> SubmitFence)
+      : Queue(Queue), SubmitFence(std::move(SubmitFence)) {}
+  DXQueue(DXQueue &&) = default;
+  ~DXQueue() override {}
 
   static llvm::Expected<DXQueue>
   createGraphicsQueue(ComPtr<ID3D12Device> Device) {
     const D3D12_COMMAND_QUEUE_DESC Desc = {D3D12_COMMAND_LIST_TYPE_DIRECT, 0,
                                            D3D12_COMMAND_QUEUE_FLAG_NONE, 0};
-    ComPtr<ID3D12CommandQueue> Queue;
-    if (auto Err =
-            HR::toError(Device->CreateCommandQueue(&Desc, IID_PPV_ARGS(&Queue)),
-                        "Failed to create command queue."))
+    ComPtr<ID3D12CommandQueue> CmdQueue;
+    if (auto Err = HR::toError(
+            Device->CreateCommandQueue(&Desc, IID_PPV_ARGS(&CmdQueue)),
+            "Failed to create command queue."))
       return Err;
-    return DXQueue(Queue);
+    auto FenceOrErr = DXFence::create(Device.Get(), "QueueSubmitFence");
+    if (!FenceOrErr)
+      return FenceOrErr.takeError();
+    return DXQueue(CmdQueue, std::move(*FenceOrErr));
   }
+
+  llvm::Error
+  submit(llvm::SmallVector<std::unique_ptr<offloadtest::CommandBuffer>> CBs)
+      override;
 };
 
 class DXCommandBuffer : public offloadtest::CommandBuffer {
@@ -444,6 +458,28 @@ private:
   DXCommandBuffer() : CommandBuffer(GPUAPI::DirectX) {}
 };
 
+llvm::Error DXQueue::submit(
+    llvm::SmallVector<std::unique_ptr<offloadtest::CommandBuffer>> CBs) {
+  for (auto &CB : CBs) {
+    auto &DCB = *llvm::cast<DXCommandBuffer>(CB.get());
+    if (auto Err =
+            HR::toError(DCB.CmdList->Close(), "Failed to close command list."))
+      return Err;
+
+    ID3D12CommandList *const CmdLists[] = {DCB.CmdList.Get()};
+    Queue->ExecuteCommandLists(1, CmdLists);
+
+    const uint64_t CurrentCounter = ++FenceCounter;
+    if (auto Err =
+            HR::toError(Queue->Signal(SubmitFence->Fence.Get(), CurrentCounter),
+                        "Failed to add signal."))
+      return Err;
+
+    if (auto Err = SubmitFence->waitForCompletion(CurrentCounter))
+      return Err;
+  }
+  return llvm::Error::success();
+}
 class DXDevice : public offloadtest::Device {
 private:
   ComPtr<IDXCoreAdapter> Adapter;
@@ -491,10 +527,10 @@ private:
 public:
   DXDevice(ComPtr<IDXCoreAdapter> A, ComPtr<ID3D12Device> D, DXQueue Q,
            std::string Desc)
-      : Adapter(A), Device(D), GraphicsQueue(Q) {
+      : Adapter(A), Device(D), GraphicsQueue(std::move(Q)) {
     Description = Desc;
   }
-  DXDevice(const DXDevice &) = default;
+  DXDevice(const DXDevice &) = delete;
 
   ~DXDevice() override = default;
 
@@ -646,9 +682,8 @@ public:
     auto GraphicsQueueOrErr = DXQueue::createGraphicsQueue(Device);
     if (!GraphicsQueueOrErr)
       return GraphicsQueueOrErr.takeError();
-    const DXQueue GraphicsQueue = *GraphicsQueueOrErr;
-
-    return std::make_unique<DXDevice>(Adapter, Device, std::move(GraphicsQueue),
+    return std::make_unique<DXDevice>(Adapter, Device,
+                                      std::move(*GraphicsQueueOrErr),
                                       std::string(DescVec.data()));
   }
 
@@ -1336,8 +1371,10 @@ public:
     IS.CB->CmdList->ResourceBarrier(1, &Barrier);
   }
 
+  // waitForSignal is used for tile mapping synchronization, not command buffer
+  // submission. TODO: Replace with a proper fence abstraction.
   llvm::Error waitForSignal(InvocationState &IS) {
-    // This is a hack but it works since this is all single threaded code.
+    // Reuse the command buffer's fence for a quick queue-level signal/wait.
     static uint64_t FenceCounter = 0;
     const uint64_t CurrentCounter = FenceCounter + 1;
     auto *F = static_cast<DXFence *>(IS.Fence.get());
@@ -1355,14 +1392,7 @@ public:
   }
 
   llvm::Error executeCommandList(InvocationState &IS) {
-    if (auto Err = HR::toError(IS.CB->CmdList->Close(),
-                               "Failed to close command list."))
-      return Err;
-
-    ID3D12CommandList *const CmdLists[] = {IS.CB->CmdList.Get()};
-    GraphicsQueue.Queue->ExecuteCommandLists(1, CmdLists);
-
-    return waitForSignal(IS);
+    return GraphicsQueue.submit(std::move(IS.CB));
   }
 
   llvm::Error createComputeCommands(Pipeline &P, InvocationState &IS) {
