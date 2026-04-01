@@ -10,6 +10,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "API/Device.h"
+#include "API/Encoder.h"
 #include "API/FormatConversion.h"
 #include "Support/Pipeline.h"
 #include "Support/VkError.h"
@@ -588,6 +589,43 @@ public:
     return CB;
   }
 
+  /// Pending pipeline barrier state accumulated by encoders. Lives on the
+  /// command buffer because in Vulkan all encoders record into the same
+  /// VkCommandBuffer.  Src tracks what prior commands produced; Dst tracks
+  /// what the next command will consume.
+  VkPipelineStageFlags PendingSrcStage = VK_PIPELINE_STAGE_HOST_BIT;
+  VkAccessFlags PendingSrcAccess = VK_ACCESS_HOST_WRITE_BIT;
+  VkPipelineStageFlags PendingDstStage = 0;
+  VkAccessFlags PendingDstAccess = 0;
+
+  void addPendingBarrier(VkPipelineStageFlags Stage, VkAccessFlags Access) {
+    PendingDstStage |= Stage;
+    PendingDstAccess |= Access;
+  }
+
+  void flushBarrier() {
+    if (PendingSrcStage == 0) {
+      // Nothing produced yet — no barrier needed, but carry dst forward as
+      // the next src (the command we're about to run will produce at these
+      // stages).
+      PendingSrcStage = PendingDstStage;
+      PendingSrcAccess = PendingDstAccess;
+      PendingDstStage = 0;
+      PendingDstAccess = 0;
+      return;
+    }
+    VkMemoryBarrier Barrier = {};
+    Barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    Barrier.srcAccessMask = PendingSrcAccess;
+    Barrier.dstAccessMask = PendingDstAccess;
+    vkCmdPipelineBarrier(CmdBuffer, PendingSrcStage, PendingDstStage, 0, 1,
+                         &Barrier, 0, nullptr, 0, nullptr);
+    PendingSrcStage = PendingDstStage;
+    PendingSrcAccess = PendingDstAccess;
+    PendingDstStage = 0;
+    PendingDstAccess = 0;
+  }
+
   ~VulkanCommandBuffer() override {
     if (CmdPool != VK_NULL_HANDLE)
       vkDestroyCommandPool(Device, CmdPool, nullptr);
@@ -597,9 +635,53 @@ public:
     return CB->getKind() == GPUAPI::Vulkan;
   }
 
+  llvm::Expected<std::unique_ptr<offloadtest::ComputeEncoder>>
+  createComputeEncoder() override;
+
 private:
   VulkanCommandBuffer() : CommandBuffer(GPUAPI::Vulkan) {}
 };
+
+class VKComputeEncoder : public offloadtest::ComputeEncoder {
+  VulkanCommandBuffer &CB;
+
+  void addDstBarrier(VkPipelineStageFlags DstStage, VkAccessFlags DstAccess) {
+    CB.addPendingBarrier(DstStage, DstAccess);
+    CB.flushBarrier();
+  }
+
+public:
+  VKComputeEncoder(VulkanCommandBuffer &CB)
+      : ComputeEncoder(GPUAPI::Vulkan), CB(CB) {}
+
+  ~VKComputeEncoder() override = default;
+
+  static bool classof(const CommandEncoder *E) {
+    return E->getAPI() == GPUAPI::Vulkan;
+  }
+
+  llvm::Error dispatch(uint32_t GroupCountX, uint32_t GroupCountY,
+                       uint32_t GroupCountZ, uint32_t /*ThreadsPerGroupX*/,
+                       uint32_t /*ThreadsPerGroupY*/,
+                       uint32_t /*ThreadsPerGroupZ*/) override {
+    // Vulkan bakes threadgroup size into the pipeline; only group counts are
+    // used for dispatch.
+    addDstBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                  VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
+
+    vkCmdDispatch(CB.CmdBuffer, GroupCountX, GroupCountY, GroupCountZ);
+    return llvm::Error::success();
+  }
+
+  void endEncoding() override {
+    // State remains on the command buffer for the next encoder.
+  }
+};
+
+llvm::Expected<std::unique_ptr<offloadtest::ComputeEncoder>>
+VulkanCommandBuffer::createComputeEncoder() {
+  return std::make_unique<VKComputeEncoder>(*this);
+}
 
 class VulkanPipelineState : public offloadtest::PipelineState {
 public:
@@ -630,7 +712,6 @@ public:
     return B->getAPI() == GPUAPI::Vulkan;
   }
 };
-
 class VulkanDevice : public offloadtest::Device {
 private:
   std::shared_ptr<VulkanInstance> Instance;
@@ -2361,7 +2442,9 @@ public:
                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            Readback.Buffer, 1, &Region);
 
-    // Barrier to make the readback buffer visible to the host.
+    // Barrier to make the readback buffer visible to the host.  These
+    // explicit HOST barriers are not managed by the encoder's barrier
+    // tracking — they are recorded directly on the command buffer.
     VkBufferMemoryBarrier BufBarrier = {};
     BufBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
     BufBarrier.size = VK_WHOLE_SIZE;
@@ -2572,10 +2655,16 @@ public:
     }
 
     if (P.isCompute()) {
+      auto EncoderOrErr = IS.CB->createComputeEncoder();
+      if (!EncoderOrErr)
+        return EncoderOrErr.takeError();
+      auto &Encoder = *EncoderOrErr.get();
       const llvm::ArrayRef<int> DispatchSize =
           llvm::ArrayRef<int>(P.Shaders[0].DispatchSize);
-      vkCmdDispatch(IS.CB->CmdBuffer, DispatchSize[0], DispatchSize[1],
-                    DispatchSize[2]);
+      if (auto Err = Encoder.dispatch(DispatchSize[0], DispatchSize[1],
+                                      DispatchSize[2], 1, 1, 1))
+        return Err;
+      Encoder.endEncoding();
       llvm::outs() << "Dispatched compute shader: { " << DispatchSize[0] << ", "
                    << DispatchSize[1] << ", " << DispatchSize[2] << " }\n";
     } else {
@@ -2888,6 +2977,13 @@ llvm::Expected<offloadtest::SubmitResult> VulkanQueue::submit(
   const uint64_t SignalValue = ++FenceCounter;
   const VkPipelineStageFlags WaitStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
 
+  // Each command buffer defaults to src=HOST, which is only correct for
+  // standalone submissions.  Multi-CB batches would need inter-CB barriers.
+  if (CBs.size() > 1)
+    llvm::errs()
+        << "Warning: submitting multiple command buffers in a single batch; "
+           "encoder barriers do not account for inter-command-buffer "
+           "dependencies.\n";
   for (auto &CB : CBs) {
     auto &VCB = *llvm::cast<VulkanCommandBuffer>(CB.get());
     if (auto Err = VK::toError(vkEndCommandBuffer(VCB.CmdBuffer),
