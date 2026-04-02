@@ -1092,6 +1092,9 @@ public:
     if (auto Err = HR::toError(Upload->Buffer->Map(0, nullptr, &Mapped),
                                "Failed to map upload buffer."))
       return Err;
+
+    // This change fixed 12 tests related to counters. Previously counter memory
+    // was not zero-initialized.
     if (UploadSize > DataSize)
       memset(Mapped, 0, UploadSize);
     memcpy(Mapped, Data, DataSize);
@@ -1107,32 +1110,63 @@ public:
     return llvm::Error::success();
   }
 
-  llvm::Expected<ResourceBundle> createSRV(Resource &R, InvocationState &IS) {
+  llvm::Expected<ResourceBundle>
+  createDescriptorResource(Resource &R, InvocationState &IS) {
     ResourceBundle Bundle;
+    const DXResourceKind Kind = getDXKind(R.Kind);
+    const bool IsUAV = Kind == UAV;
     const MemoryBacking Backing =
         R.IsReserved ? MemoryBacking::Sparse : MemoryBacking::Automatic;
+
+    // Map pipeline resource kind to texture/buffer usage.
+    const TextureUsage TexUsage =
+        IsUAV ? TextureUsage::Storage : TextureUsage::Sampled;
+    BufferUsage BufUsage = IsUAV ? BufferUsage::Storage : BufferUsage::Sampled;
+    if (Kind == CBV)
+      BufUsage = BufferUsage::Constant;
+
+    const char *KindName = IsUAV ? "UAV" : Kind == CBV ? "CBV" : "SRV";
+    const char RegPrefix = IsUAV ? 'u' : Kind == CBV ? 'b' : 't';
 
     uint32_t RegOffset = 0;
 
     for (const auto &ResData : R.BufferPtr->Data) {
-      llvm::outs() << "Creating SRV: { Size = " << R.size() << ", Register = t"
-                   << R.DXBinding.Register + RegOffset
-                   << ", Space = " << R.DXBinding.Space;
-
-      if (R.TilesMapped)
-        llvm::outs() << ", TilesMapped = " << *R.TilesMapped;
-      llvm::outs() << " }\n";
-
+      // Create the GPU resource.
       auto BROrErr =
           R.isTexture()
-              ? createTextureGPUResource(R, TextureUsage::Sampled, Backing, IS)
-              : createBufferGPUResource(R, BufferUsage::Sampled, Backing, IS);
+              ? createTextureGPUResource(R, TexUsage, Backing, IS)
+              : createBufferGPUResource(R, BufUsage, Backing, IS);
       if (!BROrErr)
         return BROrErr.takeError();
       auto BR = *BROrErr;
 
+      llvm::outs() << "Creating " << KindName
+                   << ": { Size = " << BR->getSizeInBytes() << ", Register = "
+                   << RegPrefix << R.DXBinding.Register + RegOffset
+                   << ", Space = " << R.DXBinding.Space;
+      if (IsUAV)
+        llvm::outs() << ", HasCounter = " << R.HasCounter;
+      if (R.TilesMapped)
+        llvm::outs() << ", TilesMapped = " << *R.TilesMapped;
+      llvm::outs() << " }\n";
+
+      // Upload initial data.
       if (auto Err = uploadResourceData(*BR, ResData.get(), R.size(), IS))
         return Err;
+
+      // UAV resources need a readback buffer for copying results back to CPU.
+      if (IsUAV) {
+        BufferCreateDesc ReadbackDesc = {};
+        ReadbackDesc.Location = MemoryLocation::GpuToCpu;
+        ReadbackDesc.Backing = MemoryBacking::Automatic;
+        ReadbackDesc.Usage = BufferUsage::Storage;
+        auto ReadbackOrErr =
+            createBuffer("Readback", ReadbackDesc, BR->getSizeInBytes());
+        if (!ReadbackOrErr)
+          return ReadbackOrErr.takeError();
+        auto Readback = std::static_pointer_cast<DXBuffer>(*ReadbackOrErr);
+        IS.ReadbackBindings.push_back({BR, Readback, &R, RegOffset});
+      }
 
       Bundle.push_back(BR);
       RegOffset++;
@@ -1163,52 +1197,6 @@ public:
     return HeapIdx;
   }
 
-  llvm::Expected<ResourceBundle> createUAV(Resource &R, InvocationState &IS) {
-    ResourceBundle Bundle;
-    const uint32_t BufferSize = getUAVBufferSize(R);
-    const MemoryBacking Backing =
-        R.IsReserved ? MemoryBacking::Sparse : MemoryBacking::Automatic;
-
-    uint32_t RegOffset = 0;
-
-    for (const auto &ResData : R.BufferPtr->Data) {
-      llvm::outs() << "Creating UAV: { Size = " << BufferSize
-                   << ", Register = u" << R.DXBinding.Register + RegOffset
-                   << ", Space = " << R.DXBinding.Space
-                   << ", HasCounter = " << R.HasCounter;
-
-      if (R.TilesMapped)
-        llvm::outs() << ", TilesMapped = " << *R.TilesMapped;
-      llvm::outs() << " }\n";
-
-      auto BROrErr =
-          R.isTexture()
-              ? createTextureGPUResource(R, TextureUsage::Storage, Backing, IS)
-              : createBufferGPUResource(R, BufferUsage::Storage, Backing, IS);
-      if (!BROrErr)
-        return BROrErr.takeError();
-      auto BR = *BROrErr;
-
-      if (auto Err = uploadResourceData(*BR, ResData.get(), R.size(), IS))
-        return Err;
-
-      // Create readback buffer for reading results back to CPU.
-      BufferCreateDesc ReadbackDesc = {};
-      ReadbackDesc.Location = MemoryLocation::GpuToCpu;
-      ReadbackDesc.Backing = MemoryBacking::Automatic;
-      ReadbackDesc.Usage = BufferUsage::Storage;
-      auto ReadbackOrErr =
-          createBuffer("UAVReadback", ReadbackDesc, BufferSize);
-      if (!ReadbackOrErr)
-        return ReadbackOrErr.takeError();
-      auto Readback = std::static_pointer_cast<DXBuffer>(*ReadbackOrErr);
-
-      Bundle.push_back(BR);
-      IS.ReadbackBindings.push_back({BR, Readback, &R, RegOffset});
-      RegOffset++;
-    }
-    return Bundle;
-  }
 
   // returns the next available HeapIdx
   uint32_t bindUAV(Resource &R, InvocationState &IS, uint32_t HeapIdx,
@@ -1241,32 +1229,6 @@ public:
     return (Sz + 255u) & 0xFFFFFFFFFFFFFF00;
   }
 
-  llvm::Expected<ResourceBundle> createCBV(Resource &R, InvocationState &IS) {
-    ResourceBundle Bundle;
-
-    const size_t CBVSize = getCBVSize(R.size());
-
-    uint32_t RegOffset = 0;
-    for (const auto &ResData : R.BufferPtr->Data) {
-      llvm::outs() << "Creating CBV: { Size = " << CBVSize << ", Register = b"
-                   << R.DXBinding.Register + RegOffset
-                   << ", Space = " << R.DXBinding.Space << " }\n";
-
-      auto BROrErr = createBufferGPUResource(R, BufferUsage::Constant,
-                                             MemoryBacking::Automatic, IS);
-      if (!BROrErr)
-        return BROrErr.takeError();
-      auto BR = *BROrErr;
-
-      if (auto Err = uploadResourceData(*BR, ResData.get(), R.size(), IS))
-        return Err;
-
-      Bundle.push_back(BR);
-      RegOffset++;
-    }
-    return Bundle;
-  }
-
   // returns the next available HeapIdx
   uint32_t bindCBV(Resource &R, InvocationState &IS, uint32_t HeapIdx,
                    ResourceBundle ResBundle) {
@@ -1295,33 +1257,14 @@ public:
         [&IS,
          this](Resource &R,
                llvm::SmallVectorImpl<ResourcePair> &Resources) -> llvm::Error {
-      switch (getDXKind(R.Kind)) {
-      case SRV: {
-        auto ExRes = createSRV(R, IS);
-        if (!ExRes)
-          return ExRes.takeError();
-        Resources.push_back(std::make_pair(&R, *ExRes));
-        break;
-      }
-      case UAV: {
-        auto ExRes = createUAV(R, IS);
-        if (!ExRes)
-          return ExRes.takeError();
-        Resources.push_back(std::make_pair(&R, *ExRes));
-        break;
-      }
-      case CBV: {
-        auto ExRes = createCBV(R, IS);
-        if (!ExRes)
-          return ExRes.takeError();
-        Resources.push_back(std::make_pair(&R, *ExRes));
-        break;
-      }
-      case SAMPLER:
+      if (getDXKind(R.Kind) == SAMPLER)
         return llvm::createStringError(
             std::errc::not_supported,
             "Samplers are not yet implemented for DirectX.");
-      }
+      auto ExRes = createDescriptorResource(R, IS);
+      if (!ExRes)
+        return ExRes.takeError();
+      Resources.push_back(std::make_pair(&R, *ExRes));
       return llvm::Error::success();
     };
 
