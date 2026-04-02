@@ -156,6 +156,13 @@ public:
   Texture(const Texture &) = delete;
   Texture &operator=(const Texture &) = delete;
 
+  virtual const TextureCreateDesc &getDesc() const = 0;
+
+  size_t getSizeInBytes() const {
+    const TextureCreateDesc &D = getDesc();
+    return D.Width * D.Height * getFormatSize(D.Format);
+  }
+
   GPUAPI getAPI() const { return API; }
 
 protected:

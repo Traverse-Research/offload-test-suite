@@ -84,6 +84,18 @@ inline D3D12_RESOURCE_FLAGS getDXResourceFlags(TextureUsage Usage) {
   return Flags;
 }
 
+inline D3D12_RESOURCE_FLAGS getDXResourceFlags(BufferUsage Usage) {
+  switch (Usage) {
+  case BufferUsage::Storage:
+    return D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  case BufferUsage::Sampled:
+  case BufferUsage::Constant:
+  case BufferUsage::VertexBuffer:
+    return D3D12_RESOURCE_FLAG_NONE;
+  }
+  llvm_unreachable("All BufferUsage cases handled");
+}
+
 } // namespace offloadtest
 
 #endif // OFFLOADTEST_API_DXRESOURCES_H

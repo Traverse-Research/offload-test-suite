@@ -165,6 +165,8 @@ public:
   MTLTexture(MTL::Texture *Tex, llvm::StringRef Name, TextureCreateDesc Desc)
       : offloadtest::Texture(GPUAPI::Metal), Tex(Tex), Name(Name), Desc(Desc) {}
 
+  const TextureCreateDesc &getDesc() const override { return Desc; }
+
   ~MTLTexture() override {
     if (Tex)
       Tex->release();
