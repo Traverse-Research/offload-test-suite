@@ -312,6 +312,11 @@ public:
   // Either an RTV or DSV descriptor, depending on Desc.Usage.
   ComPtr<ID3D12DescriptorHeap> ViewHeap;
   D3D12_CPU_DESCRIPTOR_HANDLE ViewHandle = {};
+
+  // Physical memory backing for sparse/tiled resources.
+  // Only valid for MemoryBacking::Sparse.
+  ComPtr<ID3D12Heap> ResourceHeap;
+
   std::string Name;
   TextureCreateDesc Desc;
 
@@ -348,10 +353,10 @@ private:
   Capabilities Caps;
 
   struct ResourceSet {
-    ComPtr<ID3D12Resource> Upload;
+    ComPtr<ID3D12Resource> Upload; // Keep-alive
     ComPtr<ID3D12Resource> Buffer;
     ComPtr<ID3D12Resource> Readback;
-    ComPtr<ID3D12Heap> Heap;
+    ComPtr<ID3D12Heap> Heap; // Keep-alive
     ResourceSet(ComPtr<ID3D12Resource> Upload, ComPtr<ID3D12Resource> Buffer,
                 ComPtr<ID3D12Resource> Readback,
                 ComPtr<ID3D12Heap> Heap = nullptr)
@@ -445,6 +450,8 @@ public:
     const D3D12_HEAP_PROPERTIES HeapProps =
         CD3DX12_HEAP_PROPERTIES(getDXHeapType(Desc.Location));
 
+    const bool IsSparse = Desc.Backing == MemoryBacking::Sparse;
+
     D3D12_RESOURCE_DESC TexDesc = {};
     TexDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     TexDesc.Width = Desc.Width;
@@ -453,7 +460,8 @@ public:
     TexDesc.MipLevels = static_cast<UINT16>(Desc.MipLevels);
     TexDesc.Format = getDXGIFormat(Desc.Format);
     TexDesc.SampleDesc.Count = 1;
-    TexDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    TexDesc.Layout = IsSparse ? D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE
+                              : D3D12_TEXTURE_LAYOUT_UNKNOWN;
     TexDesc.Flags = getDXResourceFlags(Desc.Usage);
 
     const D3D12_CLEAR_VALUE *ClearValuePtr = nullptr;
@@ -484,12 +492,20 @@ public:
       InitialState = D3D12_RESOURCE_STATE_DEPTH_WRITE;
 
     ComPtr<ID3D12Resource> DeviceTexture;
-    if (auto Err = HR::toError(Device->CreateCommittedResource(
-                                   &HeapProps, D3D12_HEAP_FLAG_NONE, &TexDesc,
-                                   InitialState, ClearValuePtr,
-                                   IID_PPV_ARGS(&DeviceTexture)),
-                               "Failed to create texture."))
-      return Err;
+    if (IsSparse) {
+      if (auto Err = HR::toError(Device->CreateReservedResource(
+                                     &TexDesc, InitialState, ClearValuePtr,
+                                     IID_PPV_ARGS(&DeviceTexture)),
+                                 "Failed to create reserved texture."))
+        return Err;
+    } else {
+      if (auto Err = HR::toError(Device->CreateCommittedResource(
+                                     &HeapProps, D3D12_HEAP_FLAG_NONE, &TexDesc,
+                                     InitialState, ClearValuePtr,
+                                     IID_PPV_ARGS(&DeviceTexture)),
+                                 "Failed to create texture."))
+        return Err;
+    }
 
     auto Tex = std::make_shared<DXTexture>(DeviceTexture, Name, Desc);
 
