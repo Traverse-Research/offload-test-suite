@@ -444,6 +444,8 @@ public:
       : offloadtest::Texture(GPUAPI::Vulkan), Dev(Dev), Image(Image),
         Memory(Memory), Name(Name), Desc(Desc) {}
 
+  const TextureCreateDesc &getDesc() const override { return Desc; }
+
   ~VulkanTexture() override {
     if (View)
       vkDestroyImageView(Dev, View, nullptr);
