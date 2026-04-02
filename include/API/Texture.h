@@ -149,6 +149,12 @@ inline llvm::Error validateTextureCreateDesc(const TextureCreateDesc &Desc) {
 class Texture {
 public:
   virtual ~Texture() = default;
+  virtual const TextureCreateDesc &getDesc() const = 0;
+
+  size_t getSizeInBytes() const {
+    const TextureCreateDesc &D = getDesc();
+    return D.Width * D.Height * getFormatSize(D.Format);
+  }
 
   Texture(const Texture &) = delete;
   Texture &operator=(const Texture &) = delete;

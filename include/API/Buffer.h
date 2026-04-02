@@ -17,7 +17,9 @@
 namespace offloadtest {
 
 enum class BufferUsage {
-  Storage,
+  Sampled,      // Read-only shader access (SRV).
+  Storage,      // Read-write shader access (UAV).
+  Constant,     // Constant/uniform buffer (CBV).
   VertexBuffer,
 };
 
