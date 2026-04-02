@@ -437,7 +437,8 @@ public:
 
     D3D12_RESOURCE_DESC TexDesc = {};
     TexDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    TexDesc.Width = Desc.Width, TexDesc.Height = Desc.Height,
+    TexDesc.Width = Desc.Width;
+    TexDesc.Height = Desc.Height;
     TexDesc.DepthOrArraySize = 1;
     TexDesc.MipLevels = static_cast<UINT16>(Desc.MipLevels);
     TexDesc.Format = getDXGIFormat(Desc.Format);
@@ -1499,7 +1500,7 @@ public:
           "No render target bound for graphics pipeline.");
     const CPUBuffer &OutBuf = *P.Bindings.RTargetBufferPtr;
 
-    auto TexOrErr = offloadtest::createRenderTarget(*this, OutBuf);
+    auto TexOrErr = offloadtest::createRenderTargetFromCPUBuffer(*this, OutBuf);
     if (!TexOrErr)
       return TexOrErr.takeError();
 
@@ -1517,7 +1518,7 @@ public:
   }
 
   llvm::Error createDepthStencil(Pipeline &P, InvocationState &IS) {
-    auto TexOrErr = offloadtest::createDepthStencil(
+    auto TexOrErr = offloadtest::createDefaultDepthStencilTarget(
         *this, P.Bindings.RTargetBufferPtr->OutputProps.Width,
         P.Bindings.RTargetBufferPtr->OutputProps.Height);
     if (!TexOrErr)

@@ -466,7 +466,7 @@ class MTLDevice : public offloadtest::Device {
           "No render target bound for graphics pipeline.");
     const CPUBuffer &OutBuf = *P.Bindings.RTargetBufferPtr;
 
-    auto TexOrErr = offloadtest::createRenderTarget(*this, OutBuf);
+    auto TexOrErr = offloadtest::createRenderTargetFromCPUBuffer(*this, OutBuf);
     if (!TexOrErr)
       return TexOrErr.takeError();
 
@@ -484,7 +484,7 @@ class MTLDevice : public offloadtest::Device {
   }
 
   llvm::Error createDepthStencil(Pipeline &P, InvocationState &IS) {
-    auto TexOrErr = offloadtest::createDepthStencil(
+    auto TexOrErr = offloadtest::createDefaultDepthStencilTarget(
         *this, P.Bindings.RTargetBufferPtr->OutputProps.Width,
         P.Bindings.RTargetBufferPtr->OutputProps.Height);
     if (!TexOrErr)
