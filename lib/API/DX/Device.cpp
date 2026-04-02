@@ -309,7 +309,7 @@ public:
   // determined at pipeline bind time. Moving them here would require a
   // descriptor heap allocator, which is not yet implemented.
   //
-  // Either an RTV or DSV descriptor, depending on Desc.Usage.
+  // Only valid `TextureUsage` is either `RenderTarget` or `DepthStencil`
   ComPtr<ID3D12DescriptorHeap> ViewHeap;
   D3D12_CPU_DESCRIPTOR_HANDLE ViewHandle = {};
 
@@ -353,14 +353,12 @@ private:
   Capabilities Caps;
 
   struct ResourceSet {
-    ComPtr<ID3D12Resource> Upload; // Keep-alive
     ComPtr<ID3D12Resource> Buffer;
     ComPtr<ID3D12Resource> Readback;
-    ComPtr<ID3D12Heap> Heap; // Keep-alive
-    ResourceSet(ComPtr<ID3D12Resource> Upload, ComPtr<ID3D12Resource> Buffer,
-                ComPtr<ID3D12Resource> Readback,
+    ComPtr<ID3D12Heap> Heap; // Keep-alive for sparse/tiled resources.
+    ResourceSet(ComPtr<ID3D12Resource> Buffer, ComPtr<ID3D12Resource> Readback,
                 ComPtr<ID3D12Heap> Heap = nullptr)
-        : Upload(Upload), Buffer(Buffer), Readback(Readback), Heap(Heap) {}
+        : Buffer(Buffer), Readback(Readback), Heap(Heap) {}
   };
 
   // ResourceBundle will contain one ResourceSet for a singular resource
@@ -388,8 +386,13 @@ private:
     // Resources for graphics pipelines.
     std::shared_ptr<DXTexture> RT;
     std::shared_ptr<DXBuffer> RTReadback;
+
     std::shared_ptr<DXTexture> DS;
     std::optional<offloadtest::VertexBuffer> VB;
+
+    // Temporary resources (e.g. upload/staging buffers) that must stay alive
+    // until the GPU finishes executing the command list.
+    llvm::SmallVector<std::shared_ptr<DXBuffer>> ResourcesKeepAlive;
 
     llvm::SmallVector<DescriptorTable> DescTables;
     llvm::SmallVector<ResourcePair> RootResources;
@@ -828,11 +831,6 @@ public:
     if (!ResDescOrErr)
       return ResDescOrErr.takeError();
     const D3D12_RESOURCE_DESC ResDesc = *ResDescOrErr;
-    const D3D12_HEAP_PROPERTIES UploadHeapProp =
-        CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
-    const D3D12_RESOURCE_DESC UploadResDesc =
-        CD3DX12_RESOURCE_DESC::Buffer(R.size());
-
     uint32_t RegOffset = 0;
 
     for (const auto &ResData : R.BufferPtr->Data) {
@@ -866,33 +864,31 @@ public:
           return Err;
       }
 
-      ComPtr<ID3D12Resource> UploadBuffer;
-      if (auto Err = HR::toError(
-              Device->CreateCommittedResource(
-                  &UploadHeapProp, D3D12_HEAP_FLAG_NONE, &UploadResDesc,
-                  D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                  IID_PPV_ARGS(&UploadBuffer)),
-              "Failed to create committed resource (upload buffer)."))
-        return Err;
-
       ComPtr<ID3D12Heap> Heap; // optional, only created if NumTiles > 0
       if (R.IsReserved)
         if (auto Err = setupReservedResource(R, IS, ResDesc, Heap, Buffer))
           return Err;
 
-      // Upload data initialization
+      // Create upload buffer, copy data, and record upload commands.
+      BufferCreateDesc UploadDesc = {};
+      UploadDesc.Location = MemoryLocation::CpuToGpu;
+      UploadDesc.Usage = BufferUsage::Storage;
+      auto UploadOrErr = createBuffer("SRVUpload", UploadDesc, R.size());
+      if (!UploadOrErr)
+        return UploadOrErr.takeError();
+      auto Upload = std::static_pointer_cast<DXBuffer>(*UploadOrErr);
+
       void *ResDataPtr = nullptr;
-      if (SUCCEEDED(UploadBuffer->Map(0, NULL, &ResDataPtr))) {
-        memcpy(ResDataPtr, ResData.get(), R.size());
-        UploadBuffer->Unmap(0, nullptr);
-      } else {
-        return llvm::createStringError(std::errc::io_error,
-                                       "Failed to map SRV upload buffer.");
-      }
+      if (auto Err = HR::toError(Upload->Buffer->Map(0, nullptr, &ResDataPtr),
+                                 "Failed to map SRV upload buffer."))
+        return Err;
+      memcpy(ResDataPtr, ResData.get(), R.size());
+      Upload->Buffer->Unmap(0, nullptr);
 
-      addResourceUploadCommands(R, IS, Buffer, UploadBuffer);
+      addResourceUploadCommands(R, IS, Buffer, Upload->Buffer);
+      IS.ResourcesKeepAlive.push_back(Upload);
 
-      Bundle.emplace_back(UploadBuffer, Buffer, nullptr, Heap);
+      Bundle.emplace_back(Buffer, nullptr, Heap);
       RegOffset++;
     }
     return Bundle;
@@ -929,25 +925,6 @@ public:
       return ResDescOrErr.takeError();
     const D3D12_RESOURCE_DESC ResDesc = *ResDescOrErr;
 
-    const D3D12_HEAP_PROPERTIES ReadBackHeapProp =
-        CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_READBACK);
-    const D3D12_RESOURCE_DESC ReadBackResDesc = {
-        D3D12_RESOURCE_DIMENSION_BUFFER,
-        0,
-        BufferSize,
-        1,
-        1,
-        1,
-        DXGI_FORMAT_UNKNOWN,
-        {1, 0},
-        D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-        D3D12_RESOURCE_FLAG_NONE};
-
-    const D3D12_HEAP_PROPERTIES UploadHeapProp =
-        CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
-    const D3D12_RESOURCE_DESC UploadResDesc =
-        CD3DX12_RESOURCE_DESC::Buffer(BufferSize);
-
     uint32_t RegOffset = 0;
 
     for (const auto &ResData : R.BufferPtr->Data) {
@@ -982,43 +959,41 @@ public:
           return Err;
       }
 
-      ComPtr<ID3D12Resource> UploadBuffer;
-      if (auto Err = HR::toError(
-              Device->CreateCommittedResource(
-                  &UploadHeapProp, D3D12_HEAP_FLAG_NONE, &UploadResDesc,
-                  D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                  IID_PPV_ARGS(&UploadBuffer)),
-              "Failed to create committed resource (upload buffer)."))
-        return Err;
-
-      // Committed readback buffer
-      ComPtr<ID3D12Resource> ReadBackBuffer;
-      if (auto Err = HR::toError(
-              Device->CreateCommittedResource(
-                  &ReadBackHeapProp, D3D12_HEAP_FLAG_NONE, &ReadBackResDesc,
-                  D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                  IID_PPV_ARGS(&ReadBackBuffer)),
-              "Failed to create committed resource (readback buffer)."))
-        return Err;
-
       ComPtr<ID3D12Heap> Heap; // optional, only created if NumTiles > 0
       if (R.IsReserved)
         if (auto Err = setupReservedResource(R, IS, ResDesc, Heap, Buffer))
           return Err;
 
-      // Upload data initialization
+      // Create upload buffer, copy data, and record upload commands.
+      BufferCreateDesc UploadDesc = {};
+      UploadDesc.Location = MemoryLocation::CpuToGpu;
+      UploadDesc.Usage = BufferUsage::Storage;
+      auto UploadOrErr = createBuffer("UAVUpload", UploadDesc, BufferSize);
+      if (!UploadOrErr)
+        return UploadOrErr.takeError();
+      auto Upload = std::static_pointer_cast<DXBuffer>(*UploadOrErr);
+
       void *ResDataPtr = nullptr;
-      if (SUCCEEDED(UploadBuffer->Map(0, NULL, &ResDataPtr))) {
-        memcpy(ResDataPtr, ResData.get(), R.size());
-        UploadBuffer->Unmap(0, nullptr);
-      } else {
-        return llvm::createStringError(std::errc::io_error,
-                                       "Failed to map UAV upload buffer.");
-      }
+      if (auto Err = HR::toError(Upload->Buffer->Map(0, nullptr, &ResDataPtr),
+                                 "Failed to map UAV upload buffer."))
+        return Err;
+      memcpy(ResDataPtr, ResData.get(), R.size());
+      Upload->Buffer->Unmap(0, nullptr);
 
-      addResourceUploadCommands(R, IS, Buffer, UploadBuffer);
+      addResourceUploadCommands(R, IS, Buffer, Upload->Buffer);
+      IS.ResourcesKeepAlive.push_back(Upload);
 
-      Bundle.emplace_back(UploadBuffer, Buffer, ReadBackBuffer, Heap);
+      // Create readback buffer for reading results back to CPU.
+      BufferCreateDesc ReadbackDesc = {};
+      ReadbackDesc.Location = MemoryLocation::GpuToCpu;
+      ReadbackDesc.Usage = BufferUsage::Storage;
+      auto ReadbackOrErr = createBuffer("UAVReadback", ReadbackDesc, BufferSize);
+      if (!ReadbackOrErr)
+        return ReadbackOrErr.takeError();
+      auto Readback = std::static_pointer_cast<DXBuffer>(*ReadbackOrErr);
+
+      IS.ResourcesKeepAlive.push_back(Readback);
+      Bundle.emplace_back(Buffer, Readback->Buffer, Heap);
       RegOffset++;
     }
     return Bundle;
@@ -1072,11 +1047,6 @@ public:
         D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
 
-    const D3D12_HEAP_PROPERTIES UploadHeapProp =
-        CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_UPLOAD);
-    const D3D12_RESOURCE_DESC UploadResDesc =
-        CD3DX12_RESOURCE_DESC::Buffer(CBVSize);
-
     uint32_t RegOffset = 0;
     for (const auto &ResData : R.BufferPtr->Data) {
       llvm::outs() << "Creating CBV: { Size = " << CBVSize << ", Register = b"
@@ -1091,28 +1061,27 @@ public:
               "Failed to create committed resource (buffer)."))
         return Err;
 
-      ComPtr<ID3D12Resource> UploadBuffer;
-      if (auto Err = HR::toError(
-              Device->CreateCommittedResource(
-                  &UploadHeapProp, D3D12_HEAP_FLAG_NONE, &UploadResDesc,
-                  D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                  IID_PPV_ARGS(&UploadBuffer)),
-              "Failed to create committed resource (upload buffer)."))
-        return Err;
+      // Create upload buffer, copy data, and record upload commands.
+      BufferCreateDesc UploadDesc = {};
+      UploadDesc.Location = MemoryLocation::CpuToGpu;
+      UploadDesc.Usage = BufferUsage::Storage;
+      auto UploadOrErr = createBuffer("CBVUpload", UploadDesc, CBVSize);
+      if (!UploadOrErr)
+        return UploadOrErr.takeError();
+      auto Upload = std::static_pointer_cast<DXBuffer>(*UploadOrErr);
 
-      // Initialize the CBV data
       void *ResDataPtr = nullptr;
-      if (auto Err = HR::toError(UploadBuffer->Map(0, nullptr, &ResDataPtr),
-                                 "Failed to acquire UAV data pointer."))
+      if (auto Err = HR::toError(Upload->Buffer->Map(0, nullptr, &ResDataPtr),
+                                 "Failed to map CBV upload buffer."))
         return Err;
       memset(ResDataPtr, 0, CBVSize);
       memcpy(ResDataPtr, ResData.get(), R.size());
+      Upload->Buffer->Unmap(0, nullptr);
 
-      UploadBuffer->Unmap(0, nullptr);
+      addResourceUploadCommands(R, IS, Buffer, Upload->Buffer);
+      IS.ResourcesKeepAlive.push_back(Upload);
 
-      addResourceUploadCommands(R, IS, Buffer, UploadBuffer);
-
-      Bundle.emplace_back(UploadBuffer, Buffer, nullptr);
+      Bundle.emplace_back(Buffer, nullptr);
       RegOffset++;
     }
     return Bundle;
