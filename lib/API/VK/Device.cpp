@@ -769,8 +769,8 @@ public:
     auto Tex = std::make_shared<VulkanTexture>(Device, Image, DeviceMemory,
                                                Name, Desc);
 
-    bool IsRT = (Desc.Usage & TextureUsage::RenderTarget) != 0;
-    bool IsDS = (Desc.Usage & TextureUsage::DepthStencil) != 0;
+    const bool IsRT = (Desc.Usage & TextureUsage::RenderTarget) != 0;
+    const bool IsDS = (Desc.Usage & TextureUsage::DepthStencil) != 0;
     if (IsRT || IsDS) {
       VkImageViewCreateInfo ViewCi = {};
       ViewCi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -1542,7 +1542,7 @@ public:
     return llvm::Error::success();
   }
 
-  llvm::Error createRenderPass(Pipeline &P, InvocationState &IS) {
+  llvm::Error createRenderPass(InvocationState &IS) {
     std::array<VkAttachmentDescription, 2> Attachments = {};
 
     Attachments[0].format = getVulkanFormat(IS.RenderTarget->Desc.Format);
@@ -1624,7 +1624,7 @@ public:
     return llvm::Error::success();
   }
 
-  llvm::Error createFrameBuffer(Pipeline &P, InvocationState &IS) {
+  llvm::Error createFrameBuffer(InvocationState &IS) {
     std::array<VkImageView, 2> Views = {IS.RenderTarget->View,
                                         IS.DepthStencil->View};
 
@@ -2007,9 +2007,9 @@ public:
                              VkImageLayout OldLayout,
                              VkAccessFlags SrcAccessMask,
                              VkPipelineStageFlags SrcStageMask) {
-    VkImageAspectFlags AspectMask = isDepthFormat(Tex.Desc.Format)
-                                        ? VK_IMAGE_ASPECT_DEPTH_BIT
-                                        : VK_IMAGE_ASPECT_COLOR_BIT;
+    const VkImageAspectFlags AspectMask = isDepthFormat(Tex.Desc.Format)
+                                              ? VK_IMAGE_ASPECT_DEPTH_BIT
+                                              : VK_IMAGE_ASPECT_COLOR_BIT;
 
     // Transition texture to transfer source.
     VkImageSubresourceRange SubRange = {};
@@ -2423,10 +2423,10 @@ public:
     if (auto Err = createResources(P, State))
       return Err;
     if (P.isGraphics()) {
-      if (auto Err = createRenderPass(P, State))
+      if (auto Err = createRenderPass(State))
         return Err;
       llvm::outs() << "Render pass created.\n";
-      if (auto Err = createFrameBuffer(P, State))
+      if (auto Err = createFrameBuffer(State))
         return Err;
       llvm::outs() << "Frame buffer created.\n";
     }
