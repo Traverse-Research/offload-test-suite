@@ -1158,6 +1158,7 @@ public:
     // Create a host-visible staging buffer for readback.
     BufferCreateDesc BufDesc = {};
     BufDesc.Location = MemoryLocation::GpuToCpu;
+    BufDesc.Backing = MemoryBacking::Automatic;
     BufDesc.Usage = BufferUsage::Storage;
     auto BufOrErr = createBuffer("RTReadback", BufDesc, RTBuf.size());
     if (!BufOrErr)
@@ -1202,6 +1203,7 @@ public:
 
       BufferCreateDesc VBBufDesc = {};
       VBBufDesc.Location = MemoryLocation::CpuToGpu;
+      VBBufDesc.Backing = MemoryBacking::Automatic;
       VBBufDesc.Usage = BufferUsage::VertexBuffer;
       auto BufOrErr =
           createBuffer("VertexBuffer", VBBufDesc, PVB.InterleavedSize);

@@ -396,6 +396,7 @@ class MTLDevice : public offloadtest::Device {
 
       BufferCreateDesc BufDesc = {};
       BufDesc.Location = MemoryLocation::CpuToGpu;
+      BufDesc.Backing = MemoryBacking::Automatic;
       BufDesc.Usage = BufferUsage::VertexBuffer;
       auto BufOrErr =
           createBuffer("VertexBuffer", BufDesc, PVB.InterleavedSize);
@@ -504,6 +505,7 @@ class MTLDevice : public offloadtest::Device {
     // Create a readback buffer for copying render target data to the CPU.
     BufferCreateDesc BufDesc = {};
     BufDesc.Location = MemoryLocation::GpuToCpu;
+    BufDesc.Backing = MemoryBacking::Automatic;
     BufDesc.Usage = BufferUsage::Storage;
     auto BufOrErr = createBuffer("RTReadback", BufDesc, OutBuf.size());
     if (!BufOrErr)
