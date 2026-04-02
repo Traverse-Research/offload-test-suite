@@ -714,22 +714,25 @@ public:
       ClearValuePtr = &ClearValue;
     }
 
-    // DX12 does not implicitly promote COMMON to DEPTH_WRITE
-    // So -for clarity- create DS and RT resources in the correct initial state.
-    D3D12_RESOURCE_STATES InitialState = D3D12_RESOURCE_STATE_COMMON;
-    if ((Desc.Usage & TextureUsage::DepthStencil) != 0)
-      InitialState = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-    else if ((Desc.Usage & TextureUsage::RenderTarget) != 0)
-      InitialState = D3D12_RESOURCE_STATE_RENDER_TARGET;
-
     ComPtr<ID3D12Resource> DeviceTexture;
     if (IsSparse) {
-      if (auto Err = HR::toError(Device->CreateReservedResource(
-                                     &TexDesc, InitialState, ClearValuePtr,
-                                     IID_PPV_ARGS(&DeviceTexture)),
-                                 "Failed to create reserved texture."))
+      // Reserved resources must start in COMMON — tiles aren't mapped yet.
+      if (auto Err =
+              HR::toError(Device->CreateReservedResource(
+                              &TexDesc, D3D12_RESOURCE_STATE_COMMON,
+                              ClearValuePtr, IID_PPV_ARGS(&DeviceTexture)),
+                          "Failed to create reserved texture."))
         return Err;
     } else {
+      // DX12 does not implicitly promote COMMON to DEPTH_WRITE
+      // So -for clarity- create DS and RT resources in the correct initial
+      // state.
+      D3D12_RESOURCE_STATES InitialState = D3D12_RESOURCE_STATE_COMMON;
+      if ((Desc.Usage & TextureUsage::DepthStencil) != 0)
+        InitialState = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+      else if ((Desc.Usage & TextureUsage::RenderTarget) != 0)
+        InitialState = D3D12_RESOURCE_STATE_RENDER_TARGET;
+
       if (auto Err = HR::toError(Device->CreateCommittedResource(
                                      &HeapProps, D3D12_HEAP_FLAG_NONE, &TexDesc,
                                      InitialState, ClearValuePtr,
@@ -1169,8 +1172,8 @@ public:
     return llvm::Error::success();
   }
 
-  llvm::Expected<ResourceBundle>
-  createDescriptorResource(Resource &R, InvocationState &IS) {
+  llvm::Expected<ResourceBundle> createDescriptorResource(Resource &R,
+                                                          InvocationState &IS) {
     ResourceBundle Bundle;
     const DXResourceKind Kind = getDXKind(R.Kind);
     const bool IsUAV = Kind == UAV;
@@ -1191,17 +1194,17 @@ public:
 
     for (const auto &ResData : R.BufferPtr->Data) {
       // Create the GPU resource.
-      auto BROrErr =
-          R.isTexture()
-              ? createTextureGPUResource(R, TexUsage, Backing, IS)
-              : createBufferGPUResource(R, BufUsage, Backing, IS);
+      auto BROrErr = R.isTexture()
+                         ? createTextureGPUResource(R, TexUsage, Backing, IS)
+                         : createBufferGPUResource(R, BufUsage, Backing, IS);
       if (!BROrErr)
         return BROrErr.takeError();
       auto BR = *BROrErr;
 
       llvm::outs() << "Creating " << KindName
-                   << ": { Size = " << BR->getSizeInBytes() << ", Register = "
-                   << RegPrefix << R.DXBinding.Register + RegOffset
+                   << ": { Size = " << BR->getSizeInBytes()
+                   << ", Register = " << RegPrefix
+                   << R.DXBinding.Register + RegOffset
                    << ", Space = " << R.DXBinding.Space;
       if (IsUAV)
         llvm::outs() << ", HasCounter = " << R.HasCounter;
@@ -1255,7 +1258,6 @@ public:
     }
     return HeapIdx;
   }
-
 
   // returns the next available HeapIdx
   uint32_t bindUAV(Resource &R, InvocationState &IS, uint32_t HeapIdx,
