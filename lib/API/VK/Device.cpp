@@ -2391,9 +2391,6 @@ public:
     }
 
     if (IS.getFullShaderStageMask() != VK_SHADER_STAGE_COMPUTE_BIT) {
-      // Vertex buffer, render target, readback buffer, and depth stencil are
-      // owned by shared_ptrs (IS.VB, IS.RenderTarget, IS.RTReadback,
-      // IS.DepthStencil).
       vkDestroyFramebuffer(Device, IS.FrameBuffer, nullptr);
       vkDestroyRenderPass(Device, IS.RenderPass, nullptr);
     }
