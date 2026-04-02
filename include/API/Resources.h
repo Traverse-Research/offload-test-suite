@@ -25,6 +25,27 @@ enum class MemoryLocation {
   GpuToCpu,
 };
 
+enum class MemoryBacking {
+  // Runtime allocates all memory for this resource.
+  // DX: CreateCommittedResource.
+  // VK: vkAllocateMemory + vkBindImageMemory.
+  // Metal: MTLDevice::newTexture / MTLDevice::newBuffer.
+  Automatic,
+  // TODO:
+  // Resource placed within a caller-managed memory pool.
+  // DX: CreatePlacedResource.
+  // VK: vkBindImageMemory at an offset within a pre-existing VkDeviceMemory.
+  // Metal: MTLHeap::newTexture / MTLHeap::newBuffer.
+  // Pooled,
+
+  // No memory allocated; physical pages mapped manually on demand.
+  // DX: CreateReservedResource + UpdateTileMappings.
+  // VK: VK_IMAGE_CREATE_SPARSE_BINDING_BIT + vkQueueBindSparse.
+  // Metal: MTLTextureDescriptor.sparseLevel + heap tile mapping
+  // (requires Apple Silicon).
+  Sparse,
+};
+
 // TODO: Add Unorm types (e.g. R8Unorm, RGBA8Unorm) which can be sampled as
 // floats.
 // TODO: Add SRGB types (e.g. RGBA8Srgb) once needed.

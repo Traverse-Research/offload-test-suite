@@ -66,6 +66,7 @@ using ClearValue = std::variant<ClearColor, ClearDepthStencil>;
 // and type (e.g. 3D textures cannot be used as DepthStencil).
 struct TextureCreateDesc {
   MemoryLocation Location;
+  MemoryBacking Backing;
   TextureUsage Usage;
   Format Fmt;
   uint32_t Width;
@@ -84,6 +85,12 @@ inline llvm::Error validateTextureCreateDesc(const TextureCreateDesc &Desc) {
         std::errc::invalid_argument,
         "Format '%s' is not compatible with texture creation.",
         getFormatName(Desc.Fmt).data());
+
+  if (Desc.Backing == MemoryBacking::Sparse &&
+      Desc.Location != MemoryLocation::GpuOnly)
+    return llvm::createStringError(
+        std::errc::invalid_argument,
+        "Sparse textures must use GpuOnly memory location.");
 
   const bool IsDepth = isDepthFormat(Desc.Fmt);
   const bool IsRT = (Desc.Usage & TextureUsage::RenderTarget) != 0;
