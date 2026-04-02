@@ -200,39 +200,6 @@ static DXResourceKind getDXKind(offloadtest::ResourceKind RK) {
   llvm_unreachable("All cases handled");
 }
 
-static llvm::Expected<D3D12_RESOURCE_DESC>
-getResourceDescription(const Resource &R) {
-  const D3D12_RESOURCE_DIMENSION Dimension = getDXDimension(R.Kind);
-  const offloadtest::CPUBuffer &B = *R.BufferPtr;
-
-  if (B.OutputProps.MipLevels != 1)
-    return llvm::createStringError(std::errc::not_supported,
-                                   "Multiple mip levels are not yet supported "
-                                   "for DirectX textures.");
-
-  const DXGI_FORMAT Format =
-      R.isTexture() ? getDXFormat(B.Format, B.Channels) : DXGI_FORMAT_UNKNOWN;
-  const uint32_t Width =
-      R.isTexture() ? B.OutputProps.Width : getUAVBufferSize(R);
-  const uint32_t Height = R.isTexture() ? B.OutputProps.Height : 1;
-  D3D12_TEXTURE_LAYOUT Layout;
-
-  if (R.isTexture())
-    Layout =
-        R.IsReserved && (getDXKind(R.Kind) == SRV || getDXKind(R.Kind) == UAV)
-            ? D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE
-            : D3D12_TEXTURE_LAYOUT_UNKNOWN;
-  else
-    Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-
-  const D3D12_RESOURCE_FLAGS Flags =
-      R.isReadWrite() ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
-                      : D3D12_RESOURCE_FLAG_NONE;
-  const D3D12_RESOURCE_DESC ResDesc = {Dimension, 0,      Width,  Height, 1, 1,
-                                       Format,    {1, 0}, Layout, Flags};
-  return ResDesc;
-}
-
 static D3D12_SHADER_RESOURCE_VIEW_DESC getSRVDescription(const Resource &R) {
   const uint32_t EltSize = R.getElementSize();
   const uint32_t NumElts = R.size() / EltSize;
@@ -316,6 +283,9 @@ namespace {
 class DXBuffer : public offloadtest::Buffer {
 public:
   ComPtr<ID3D12Resource> Buffer;
+  // Physical memory backing for sparse/tiled resources.
+  // Only valid for MemoryBacking::Sparse.
+  ComPtr<ID3D12Heap> ResourceHeap;
   std::string Name;
   BufferCreateDesc Desc;
   size_t SizeInBytes;
@@ -560,18 +530,35 @@ private:
   DescriptorAllocator RTVAllocator;
   DescriptorAllocator DSVAllocator;
 
-  struct ResourceSet {
-    ComPtr<ID3D12Resource> Buffer;
-    ComPtr<ID3D12Resource> Readback;
-    ComPtr<ID3D12Heap> Heap; // Keep-alive for sparse/tiled resources.
-    ResourceSet(ComPtr<ID3D12Resource> Buffer, ComPtr<ID3D12Resource> Readback,
-                ComPtr<ID3D12Heap> Heap = nullptr)
-        : Buffer(Buffer), Readback(Readback), Heap(Heap) {}
+  // A GPU resource created for a descriptor set binding. Holds either a
+  // texture or a buffer.
+  struct BoundResource {
+    std::variant<std::shared_ptr<DXTexture>, std::shared_ptr<DXBuffer>>
+        Resource;
+
+    ComPtr<ID3D12Resource> getNativeResource() const {
+      return std::visit(
+          [](const auto &R) -> ComPtr<ID3D12Resource> {
+            using T = std::decay_t<decltype(*R)>;
+            if constexpr (std::is_same_v<T, DXTexture>)
+              return R->Resource;
+            else
+              return R->Buffer;
+          },
+          Resource);
+    }
   };
 
-  // ResourceBundle will contain one ResourceSet for a singular resource
-  // or multiple ResourceSets for resource array.
-  using ResourceBundle = llvm::SmallVector<ResourceSet>;
+  // Pairs a source GPU resource with a CPU-readable readback buffer for
+  // copying results back after execution.
+  struct ReadbackBinding {
+    std::shared_ptr<BoundResource> Source;
+    std::shared_ptr<DXBuffer> Destination;
+    offloadtest::Resource *PipelineResource; // For readback data routing.
+    uint32_t ArrayIndex;                     // Index within resource array.
+  };
+
+  using ResourceBundle = llvm::SmallVector<std::shared_ptr<BoundResource>>;
   using ResourcePair = std::pair<offloadtest::Resource *, ResourceBundle>;
 
   struct DescriptorTable {
@@ -594,6 +581,9 @@ private:
     // Temporary resources (e.g. upload/staging buffers) that must stay alive
     // until the GPU finishes executing the command list.
     llvm::SmallVector<std::shared_ptr<DXBuffer>> ResourcesKeepAlive;
+
+    // Readback bindings for copying results back to CPU after execution.
+    llvm::SmallVector<ReadbackBinding> ReadbackBindings;
 
     llvm::SmallVector<DescriptorTable> DescTables;
     llvm::SmallVector<ResourcePair> RootResources;
@@ -640,22 +630,31 @@ public:
     const D3D12_RESOURCE_DESC BufferDesc =
         CD3DX12_RESOURCE_DESC::Buffer(SizeInBytes, Flags);
 
-    D3D12_RESOURCE_STATES InitialState = D3D12_RESOURCE_STATE_COMMON;
-    if (HeapType == D3D12_HEAP_TYPE_UPLOAD)
-      InitialState = D3D12_RESOURCE_STATE_GENERIC_READ;
-    else if (HeapType == D3D12_HEAP_TYPE_READBACK)
-      // As per the readback heap docs
-      // > Resources in this heap must be created with
-      // > D3D12_RESOURCE_STATE_COPY_DEST, and cannot be changed away from this.
-      InitialState = D3D12_RESOURCE_STATE_COPY_DEST;
-
     ComPtr<ID3D12Resource> DeviceBuffer;
-    if (auto Err =
-            HR::toError(Device->CreateCommittedResource(
-                            &HeapProps, D3D12_HEAP_FLAG_NONE, &BufferDesc,
-                            InitialState, nullptr, IID_PPV_ARGS(&DeviceBuffer)),
-                        "Failed to create buffer."))
-      return Err;
+    if (Desc.Backing == MemoryBacking::Sparse) {
+      if (auto Err = HR::toError(Device->CreateReservedResource(
+                                     &BufferDesc, D3D12_RESOURCE_STATE_COMMON,
+                                     nullptr, IID_PPV_ARGS(&DeviceBuffer)),
+                                 "Failed to create reserved buffer."))
+        return Err;
+    } else {
+      D3D12_RESOURCE_STATES InitialState = D3D12_RESOURCE_STATE_COMMON;
+      if (HeapType == D3D12_HEAP_TYPE_UPLOAD)
+        InitialState = D3D12_RESOURCE_STATE_GENERIC_READ;
+      else if (HeapType == D3D12_HEAP_TYPE_READBACK)
+        // As per the readback heap docs
+        // > Resources in this heap must be created with
+        // > D3D12_RESOURCE_STATE_COPY_DEST, and cannot be changed away from
+        // this.
+        InitialState = D3D12_RESOURCE_STATE_COPY_DEST;
+
+      if (auto Err = HR::toError(Device->CreateCommittedResource(
+                                     &HeapProps, D3D12_HEAP_FLAG_NONE,
+                                     &BufferDesc, InitialState, nullptr,
+                                     IID_PPV_ARGS(&DeviceBuffer)),
+                                 "Failed to create buffer."))
+        return Err;
+    }
 
     return std::make_unique<DXBuffer>(DeviceBuffer, Name, Desc, SizeInBytes);
   }
@@ -664,6 +663,11 @@ public:
   createTexture(std::string Name, TextureCreateDesc &Desc) override {
     if (auto Err = validateTextureCreateDesc(Desc))
       return Err;
+
+    if (Desc.MipLevels != 1)
+      return llvm::createStringError(
+          std::errc::not_supported,
+          "Multiple mip levels are not yet supported for DirectX textures.");
 
     const D3D12_HEAP_PROPERTIES HeapProps =
         CD3DX12_HEAP_PROPERTIES(getDXHeapType(Desc.Location));
@@ -703,11 +707,13 @@ public:
       ClearValuePtr = &ClearValue;
     }
 
+    // DX12 does not implicitly promote COMMON to DEPTH_WRITE
+    // So -for clarity- create DS and RT resources in the correct initial state.
     D3D12_RESOURCE_STATES InitialState = D3D12_RESOURCE_STATE_COMMON;
-    if ((Desc.Usage & TextureUsage::RenderTarget) != 0)
-      InitialState = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    else if ((Desc.Usage & TextureUsage::DepthStencil) != 0)
+    if ((Desc.Usage & TextureUsage::DepthStencil) != 0)
       InitialState = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    else if ((Desc.Usage & TextureUsage::RenderTarget) != 0)
+      InitialState = D3D12_RESOURCE_STATE_RENDER_TARGET;
 
     ComPtr<ID3D12Resource> DeviceTexture;
     if (IsSparse) {
@@ -1049,11 +1055,9 @@ public:
 
   llvm::Expected<ResourceBundle> createSRV(Resource &R, InvocationState &IS) {
     ResourceBundle Bundle;
+    const MemoryBacking Backing =
+        R.IsReserved ? MemoryBacking::Sparse : MemoryBacking::Automatic;
 
-    auto ResDescOrErr = getResourceDescription(R);
-    if (!ResDescOrErr)
-      return ResDescOrErr.takeError();
-    const D3D12_RESOURCE_DESC ResDesc = *ResDescOrErr;
     uint32_t RegOffset = 0;
 
     for (const auto &ResData : R.BufferPtr->Data) {
@@ -1065,36 +1069,57 @@ public:
         llvm::outs() << ", TilesMapped = " << *R.TilesMapped;
       llvm::outs() << " }\n";
 
-      ComPtr<ID3D12Resource> Buffer;
-      if (R.IsReserved) {
-        if (auto Err =
-                HR::toError(Device->CreateReservedResource(
-                                &ResDesc, D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                IID_PPV_ARGS(&Buffer)),
-                            "Failed to create reserved resource (buffer)."))
-          return Err;
+      auto BR = std::make_shared<BoundResource>();
+      if (R.isTexture()) {
+        const CPUBuffer &B = *R.BufferPtr;
+        auto FmtOrErr = toFormat(B.Format, B.Channels);
+        if (!FmtOrErr)
+          return FmtOrErr.takeError();
+
+        TextureCreateDesc TexDesc = {};
+        TexDesc.Location = MemoryLocation::GpuOnly;
+        TexDesc.Backing = Backing;
+        TexDesc.Usage = TextureUsage::Sampled;
+        TexDesc.Format = *FmtOrErr;
+        TexDesc.Width = B.OutputProps.Width;
+        TexDesc.Height = B.OutputProps.Height;
+        TexDesc.MipLevels = B.OutputProps.MipLevels;
+
+        auto TexOrErr = createTexture("SRV", TexDesc);
+        if (!TexOrErr)
+          return TexOrErr.takeError();
+        auto Tex = std::static_pointer_cast<DXTexture>(*TexOrErr);
+
+        if (R.IsReserved) {
+          D3D12_RESOURCE_DESC NativeDesc = Tex->Resource->GetDesc();
+          if (auto Err = setupReservedResource(
+                  R, IS, NativeDesc, Tex->ResourceHeap, Tex->Resource))
+            return Err;
+        }
+        BR->Resource = Tex;
       } else {
-        // for committed resources
-        const D3D12_HEAP_PROPERTIES CommittedResourceHeapProp =
-            CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+        BufferCreateDesc BufDesc = {};
+        BufDesc.Location = MemoryLocation::GpuOnly;
+        BufDesc.Backing = Backing;
+        BufDesc.Usage = BufferUsage::Storage;
+        auto BufOrErr = createBuffer("SRV", BufDesc, R.size());
+        if (!BufOrErr)
+          return BufOrErr.takeError();
+        auto Buf = std::static_pointer_cast<DXBuffer>(*BufOrErr);
 
-        if (auto Err = HR::toError(
-                Device->CreateCommittedResource(&CommittedResourceHeapProp,
-                                                D3D12_HEAP_FLAG_NONE, &ResDesc,
-                                                D3D12_RESOURCE_STATE_COMMON,
-                                                nullptr, IID_PPV_ARGS(&Buffer)),
-                "Failed to create committed resource (buffer)."))
-          return Err;
+        if (R.IsReserved) {
+          D3D12_RESOURCE_DESC NativeDesc = Buf->Buffer->GetDesc();
+          if (auto Err = setupReservedResource(R, IS, NativeDesc,
+                                               Buf->ResourceHeap, Buf->Buffer))
+            return Err;
+        }
+        BR->Resource = Buf;
       }
-
-      ComPtr<ID3D12Heap> Heap; // optional, only created if NumTiles > 0
-      if (R.IsReserved)
-        if (auto Err = setupReservedResource(R, IS, ResDesc, Heap, Buffer))
-          return Err;
 
       // Create upload buffer, copy data, and record upload commands.
       BufferCreateDesc UploadDesc = {};
       UploadDesc.Location = MemoryLocation::CpuToGpu;
+      UploadDesc.Backing = MemoryBacking::Automatic;
       UploadDesc.Usage = BufferUsage::Storage;
       auto UploadOrErr = createBuffer("SRVUpload", UploadDesc, R.size());
       if (!UploadOrErr)
@@ -1108,10 +1133,10 @@ public:
       memcpy(ResDataPtr, ResData.get(), R.size());
       Upload->Buffer->Unmap(0, nullptr);
 
-      addResourceUploadCommands(R, IS, Buffer, Upload->Buffer);
+      addResourceUploadCommands(R, IS, BR->getNativeResource(), Upload->Buffer);
       IS.ResourcesKeepAlive.push_back(Upload);
 
-      Bundle.emplace_back(Buffer, nullptr, Heap);
+      Bundle.push_back(BR);
       RegOffset++;
     }
     return Bundle;
@@ -1128,12 +1153,13 @@ public:
     const D3D12_CPU_DESCRIPTOR_HANDLE SRVHandleHeapStart =
         IS.DescHeap->GetCPUDescriptorHandleForHeapStart();
 
-    for (const ResourceSet &RS : ResBundle) {
+    for (const auto &BR : ResBundle) {
       llvm::outs() << "SRV: HeapIdx = " << HeapIdx << " EltSize = " << EltSize
                    << " NumElts = " << NumElts << "\n";
       D3D12_CPU_DESCRIPTOR_HANDLE SRVHandle = SRVHandleHeapStart;
       SRVHandle.ptr += HeapIdx * DescHandleIncSize;
-      Device->CreateShaderResourceView(RS.Buffer.Get(), &SRVDesc, SRVHandle);
+      Device->CreateShaderResourceView(BR->getNativeResource().Get(), &SRVDesc,
+                                       SRVHandle);
       HeapIdx++;
     }
     return HeapIdx;
@@ -1142,11 +1168,8 @@ public:
   llvm::Expected<ResourceBundle> createUAV(Resource &R, InvocationState &IS) {
     ResourceBundle Bundle;
     const uint32_t BufferSize = getUAVBufferSize(R);
-
-    auto ResDescOrErr = getResourceDescription(R);
-    if (!ResDescOrErr)
-      return ResDescOrErr.takeError();
-    const D3D12_RESOURCE_DESC ResDesc = *ResDescOrErr;
+    const MemoryBacking Backing =
+        R.IsReserved ? MemoryBacking::Sparse : MemoryBacking::Automatic;
 
     uint32_t RegOffset = 0;
 
@@ -1160,36 +1183,57 @@ public:
         llvm::outs() << ", TilesMapped = " << *R.TilesMapped;
       llvm::outs() << " }\n";
 
-      ComPtr<ID3D12Resource> Buffer;
-      if (R.IsReserved) {
-        if (auto Err =
-                HR::toError(Device->CreateReservedResource(
-                                &ResDesc, D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                IID_PPV_ARGS(&Buffer)),
-                            "Failed to create reserved resource (buffer)."))
-          return Err;
+      auto BR = std::make_shared<BoundResource>();
+      if (R.isTexture()) {
+        const CPUBuffer &B = *R.BufferPtr;
+        auto FmtOrErr = toFormat(B.Format, B.Channels);
+        if (!FmtOrErr)
+          return FmtOrErr.takeError();
+
+        TextureCreateDesc TexDesc = {};
+        TexDesc.Location = MemoryLocation::GpuOnly;
+        TexDesc.Backing = Backing;
+        TexDesc.Usage = TextureUsage::Storage;
+        TexDesc.Format = *FmtOrErr;
+        TexDesc.Width = B.OutputProps.Width;
+        TexDesc.Height = B.OutputProps.Height;
+        TexDesc.MipLevels = B.OutputProps.MipLevels;
+
+        auto TexOrErr = createTexture("UAV", TexDesc);
+        if (!TexOrErr)
+          return TexOrErr.takeError();
+        auto Tex = std::static_pointer_cast<DXTexture>(*TexOrErr);
+
+        if (R.IsReserved) {
+          D3D12_RESOURCE_DESC NativeDesc = Tex->Resource->GetDesc();
+          if (auto Err = setupReservedResource(
+                  R, IS, NativeDesc, Tex->ResourceHeap, Tex->Resource))
+            return Err;
+        }
+        BR->Resource = Tex;
       } else {
-        // for committed resources
-        const D3D12_HEAP_PROPERTIES CommittedResourceHeapProp =
-            CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+        BufferCreateDesc BufDesc = {};
+        BufDesc.Location = MemoryLocation::GpuOnly;
+        BufDesc.Backing = Backing;
+        BufDesc.Usage = BufferUsage::Storage;
+        auto BufOrErr = createBuffer("UAV", BufDesc, BufferSize);
+        if (!BufOrErr)
+          return BufOrErr.takeError();
+        auto Buf = std::static_pointer_cast<DXBuffer>(*BufOrErr);
 
-        if (auto Err = HR::toError(
-                Device->CreateCommittedResource(&CommittedResourceHeapProp,
-                                                D3D12_HEAP_FLAG_NONE, &ResDesc,
-                                                D3D12_RESOURCE_STATE_COMMON,
-                                                nullptr, IID_PPV_ARGS(&Buffer)),
-                "Failed to create committed resource (buffer)."))
-          return Err;
+        if (R.IsReserved) {
+          D3D12_RESOURCE_DESC NativeDesc = Buf->Buffer->GetDesc();
+          if (auto Err = setupReservedResource(R, IS, NativeDesc,
+                                               Buf->ResourceHeap, Buf->Buffer))
+            return Err;
+        }
+        BR->Resource = Buf;
       }
-
-      ComPtr<ID3D12Heap> Heap; // optional, only created if NumTiles > 0
-      if (R.IsReserved)
-        if (auto Err = setupReservedResource(R, IS, ResDesc, Heap, Buffer))
-          return Err;
 
       // Create upload buffer, copy data, and record upload commands.
       BufferCreateDesc UploadDesc = {};
       UploadDesc.Location = MemoryLocation::CpuToGpu;
+      UploadDesc.Backing = MemoryBacking::Automatic;
       UploadDesc.Usage = BufferUsage::Storage;
       auto UploadOrErr = createBuffer("UAVUpload", UploadDesc, BufferSize);
       if (!UploadOrErr)
@@ -1203,20 +1247,22 @@ public:
       memcpy(ResDataPtr, ResData.get(), R.size());
       Upload->Buffer->Unmap(0, nullptr);
 
-      addResourceUploadCommands(R, IS, Buffer, Upload->Buffer);
+      addResourceUploadCommands(R, IS, BR->getNativeResource(), Upload->Buffer);
       IS.ResourcesKeepAlive.push_back(Upload);
 
       // Create readback buffer for reading results back to CPU.
       BufferCreateDesc ReadbackDesc = {};
       ReadbackDesc.Location = MemoryLocation::GpuToCpu;
+      ReadbackDesc.Backing = MemoryBacking::Automatic;
       ReadbackDesc.Usage = BufferUsage::Storage;
-      auto ReadbackOrErr = createBuffer("UAVReadback", ReadbackDesc, BufferSize);
+      auto ReadbackOrErr =
+          createBuffer("UAVReadback", ReadbackDesc, BufferSize);
       if (!ReadbackOrErr)
         return ReadbackOrErr.takeError();
       auto Readback = std::static_pointer_cast<DXBuffer>(*ReadbackOrErr);
 
-      IS.ResourcesKeepAlive.push_back(Readback);
-      Bundle.emplace_back(Buffer, Readback->Buffer, Heap);
+      Bundle.push_back(BR);
+      IS.ReadbackBindings.push_back({BR, Readback, &R, RegOffset});
       RegOffset++;
     }
     return Bundle;
@@ -1233,16 +1279,17 @@ public:
     const D3D12_CPU_DESCRIPTOR_HANDLE UAVHandleHeapStart =
         IS.DescHeap->GetCPUDescriptorHandleForHeapStart();
 
-    for (const ResourceSet &RS : ResBundle) {
+    for (const auto &BR : ResBundle) {
       llvm::outs() << "UAV: HeapIdx = " << HeapIdx << " EltSize = " << EltSize
                    << " NumElts = " << NumElts
                    << " HasCounter = " << R.HasCounter << "\n";
 
       D3D12_CPU_DESCRIPTOR_HANDLE UAVHandle = UAVHandleHeapStart;
       UAVHandle.ptr += HeapIdx * DescHandleIncSize;
-      ID3D12Resource *CounterBuffer = R.HasCounter ? RS.Buffer.Get() : nullptr;
-      Device->CreateUnorderedAccessView(RS.Buffer.Get(), CounterBuffer,
-                                        &UAVDesc, UAVHandle);
+      ComPtr<ID3D12Resource> Native = BR->getNativeResource();
+      ID3D12Resource *CounterBuffer = R.HasCounter ? Native.Get() : nullptr;
+      Device->CreateUnorderedAccessView(Native.Get(), CounterBuffer, &UAVDesc,
+                                        UAVHandle);
       HeapIdx++;
     }
     return HeapIdx;
@@ -1256,19 +1303,6 @@ public:
     ResourceBundle Bundle;
 
     const size_t CBVSize = getCBVSize(R.size());
-    const D3D12_HEAP_PROPERTIES HeapProp =
-        CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
-    const D3D12_RESOURCE_DESC ResDesc = {
-        D3D12_RESOURCE_DIMENSION_BUFFER,
-        0,
-        CBVSize,
-        1,
-        1,
-        1,
-        DXGI_FORMAT_UNKNOWN,
-        {1, 0},
-        D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
 
     uint32_t RegOffset = 0;
     for (const auto &ResData : R.BufferPtr->Data) {
@@ -1276,17 +1310,19 @@ public:
                    << R.DXBinding.Register + RegOffset
                    << ", Space = " << R.DXBinding.Space << " }\n";
 
-      ComPtr<ID3D12Resource> Buffer;
-      if (auto Err = HR::toError(
-              Device->CreateCommittedResource(
-                  &HeapProp, D3D12_HEAP_FLAG_NONE, &ResDesc,
-                  D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&Buffer)),
-              "Failed to create committed resource (buffer)."))
-        return Err;
+      BufferCreateDesc BufDesc = {};
+      BufDesc.Location = MemoryLocation::GpuOnly;
+      BufDesc.Backing = MemoryBacking::Automatic;
+      BufDesc.Usage = BufferUsage::Storage;
+      auto BufOrErr = createBuffer("CBV", BufDesc, CBVSize);
+      if (!BufOrErr)
+        return BufOrErr.takeError();
+      auto Buf = std::static_pointer_cast<DXBuffer>(*BufOrErr);
 
       // Create upload buffer, copy data, and record upload commands.
       BufferCreateDesc UploadDesc = {};
       UploadDesc.Location = MemoryLocation::CpuToGpu;
+      UploadDesc.Backing = MemoryBacking::Automatic;
       UploadDesc.Usage = BufferUsage::Storage;
       auto UploadOrErr = createBuffer("CBVUpload", UploadDesc, CBVSize);
       if (!UploadOrErr)
@@ -1301,10 +1337,10 @@ public:
       memcpy(ResDataPtr, ResData.get(), R.size());
       Upload->Buffer->Unmap(0, nullptr);
 
-      addResourceUploadCommands(R, IS, Buffer, Upload->Buffer);
+      addResourceUploadCommands(R, IS, Buf->Buffer, Upload->Buffer);
       IS.ResourcesKeepAlive.push_back(Upload);
 
-      Bundle.emplace_back(Buffer, nullptr);
+      Bundle.push_back(std::make_shared<BoundResource>(BoundResource{Buf}));
       RegOffset++;
     }
     return Bundle;
@@ -1319,11 +1355,12 @@ public:
     const D3D12_CPU_DESCRIPTOR_HANDLE CVBHandleHeapStart =
         IS.DescHeap->GetCPUDescriptorHandleForHeapStart();
 
-    for (const ResourceSet &RS : ResBundle) {
+    for (const auto &BR : ResBundle) {
       llvm::outs() << "CBV: HeapIdx = " << HeapIdx << " Size = " << CBVSize
                    << "\n";
       const D3D12_CONSTANT_BUFFER_VIEW_DESC CBVDesc = {
-          RS.Buffer->GetGPUVirtualAddress(), static_cast<uint32_t>(CBVSize)};
+          BR->getNativeResource()->GetGPUVirtualAddress(),
+          static_cast<uint32_t>(CBVSize)};
       D3D12_CPU_DESCRIPTOR_HANDLE CBVHandle = CVBHandleHeapStart;
       CBVHandle.ptr += HeapIdx * DescHandleIncSize;
       Device->CreateConstantBufferView(&CBVDesc, CBVHandle);
@@ -1526,18 +1563,21 @@ public:
           switch (getDXKind(RootDescIt->first->Kind)) {
           case SRV:
             IS.CB->CmdList->SetComputeRootShaderResourceView(
-                RootParamIndex++,
-                RootDescIt->second.back().Buffer->GetGPUVirtualAddress());
+                RootParamIndex++, RootDescIt->second.back()
+                                      ->getNativeResource()
+                                      ->GetGPUVirtualAddress());
             break;
           case UAV:
             IS.CB->CmdList->SetComputeRootUnorderedAccessView(
-                RootParamIndex++,
-                RootDescIt->second.back().Buffer->GetGPUVirtualAddress());
+                RootParamIndex++, RootDescIt->second.back()
+                                      ->getNativeResource()
+                                      ->GetGPUVirtualAddress());
             break;
           case CBV:
             IS.CB->CmdList->SetComputeRootConstantBufferView(
-                RootParamIndex++,
-                RootDescIt->second.back().Buffer->GetGPUVirtualAddress());
+                RootParamIndex++, RootDescIt->second.back()
+                                      ->getNativeResource()
+                                      ->GetGPUVirtualAddress());
             break;
           case SAMPLER:
             llvm_unreachable("Not implemented yet.");
@@ -1561,82 +1601,51 @@ public:
 
     IS.CB->CmdList->Dispatch(DispatchSize[0], DispatchSize[1], DispatchSize[2]);
 
-    auto CopyBackResource = [&IS, this](ResourcePair &R) {
-      if (R.first->isTexture()) {
-        const offloadtest::CPUBuffer &B = *R.first->BufferPtr;
+    // Copy UAV results to readback buffers.
+    for (const auto &RB : IS.ReadbackBindings) {
+      ComPtr<ID3D12Resource> Src = RB.Source->getNativeResource();
+      addReadbackBeginBarrier(IS, Src);
+
+      if (auto *Tex =
+              std::get_if<std::shared_ptr<DXTexture>>(&RB.Source->Resource)) {
+        const TextureCreateDesc &Desc = (*Tex)->Desc;
         const D3D12_PLACED_SUBRESOURCE_FOOTPRINT Footprint{
             0, CD3DX12_SUBRESOURCE_FOOTPRINT(
-                   getDXFormat(B.Format, B.Channels), B.OutputProps.Width,
-                   B.OutputProps.Height, 1,
-                   B.OutputProps.Width * B.getElementSize())};
-        for (const ResourceSet &RS : R.second) {
-          if (RS.Readback == nullptr)
-            continue;
-          addReadbackBeginBarrier(IS, RS.Buffer);
-          const CD3DX12_TEXTURE_COPY_LOCATION DstLoc(RS.Readback.Get(),
-                                                     Footprint);
-          const CD3DX12_TEXTURE_COPY_LOCATION SrcLoc(RS.Buffer.Get(), 0);
-          IS.CB->CmdList->CopyTextureRegion(&DstLoc, 0, 0, 0, &SrcLoc, nullptr);
-          addReadbackEndBarrier(IS, RS.Buffer);
-        }
-        return;
+                   getDXGIFormat(Desc.Format), Desc.Width, Desc.Height, 1,
+                   Desc.Width * getFormatSize(Desc.Format))};
+        const CD3DX12_TEXTURE_COPY_LOCATION DstLoc(RB.Destination->Buffer.Get(),
+                                                   Footprint);
+        const CD3DX12_TEXTURE_COPY_LOCATION SrcLoc(Src.Get(), 0);
+        IS.CB->CmdList->CopyTextureRegion(&DstLoc, 0, 0, 0, &SrcLoc, nullptr);
+      } else {
+        IS.CB->CmdList->CopyResource(RB.Destination->Buffer.Get(), Src.Get());
       }
-      for (const ResourceSet &RS : R.second) {
-        if (RS.Readback == nullptr)
-          continue;
-        addReadbackBeginBarrier(IS, RS.Buffer);
-        IS.CB->CmdList->CopyResource(RS.Readback.Get(), RS.Buffer.Get());
-        addReadbackEndBarrier(IS, RS.Buffer);
-      }
-    };
 
-    for (auto &Table : IS.DescTables)
-      for (auto &R : Table.Resources)
-        CopyBackResource(R);
-
-    for (auto &R : IS.RootResources)
-      CopyBackResource(R);
+      addReadbackEndBarrier(IS, Src);
+    }
 
     return llvm::Error::success();
   }
 
   llvm::Error readBack(Pipeline &P, InvocationState &IS) {
-    auto MemCpyBack = [](ResourcePair &R) -> llvm::Error {
-      if (!R.first->isReadWrite())
-        return llvm::Error::success();
-
-      auto *RSIt = R.second.begin();
-      auto *DataIt = R.first->BufferPtr->Data.begin();
-      for (; RSIt != R.second.end() && DataIt != R.first->BufferPtr->Data.end();
-           ++RSIt, ++DataIt) {
-        void *DataPtr;
-        if (auto Err = HR::toError(RSIt->Readback->Map(0, nullptr, &DataPtr),
-                                   "Failed to map result."))
-          return Err;
-        memcpy(DataIt->get(), DataPtr, R.first->size());
-
-        if (R.first->HasCounter) {
-          uint32_t Counter;
-          memcpy(&Counter,
-                 static_cast<char *>(DataPtr) +
-                     getUAVBufferCounterOffset(*R.first),
-                 sizeof(uint32_t));
-          R.first->BufferPtr->Counters.push_back(Counter);
-        }
-        RSIt->Readback->Unmap(0, nullptr);
-      }
-
-      return llvm::Error::success();
-    };
-
-    for (auto &Table : IS.DescTables)
-      for (auto &R : Table.Resources)
-        if (auto Err = MemCpyBack(R))
-          return Err;
-
-    for (auto &R : IS.RootResources)
-      if (auto Err = MemCpyBack(R))
+    for (const auto &RB : IS.ReadbackBindings) {
+      offloadtest::Resource *R = RB.PipelineResource;
+      void *DataPtr;
+      if (auto Err =
+              HR::toError(RB.Destination->Buffer->Map(0, nullptr, &DataPtr),
+                          "Failed to map result."))
         return Err;
+      memcpy(R->BufferPtr->Data[RB.ArrayIndex].get(), DataPtr, R->size());
+
+      if (R->HasCounter) {
+        uint32_t Counter;
+        memcpy(&Counter,
+               static_cast<char *>(DataPtr) + getUAVBufferCounterOffset(*R),
+               sizeof(uint32_t));
+        R->BufferPtr->Counters.push_back(Counter);
+      }
+      RB.Destination->Buffer->Unmap(0, nullptr);
+    }
 
     // If there is no render target, return early.
     if (!IS.RTReadback)
@@ -1700,6 +1709,7 @@ public:
     // Create readback buffer sized for the pixel data (raw bytes).
     BufferCreateDesc BufDesc = {};
     BufDesc.Location = MemoryLocation::GpuToCpu;
+    BufDesc.Backing = MemoryBacking::Automatic;
     BufDesc.Usage = BufferUsage::Storage;
     auto BufOrErr = createBuffer("RTReadback", BufDesc, OutBuf.size());
     if (!BufOrErr)
@@ -1869,41 +1879,28 @@ public:
 
     IS.CB->CmdList->CopyTextureRegion(&DstLoc, 0, 0, 0, &SrcLoc, nullptr);
 
-    auto CopyBackResource = [&IS, this](ResourcePair &R) {
-      if (R.first->isTexture()) {
-        const offloadtest::CPUBuffer &B = *R.first->BufferPtr;
+    // Copy UAV results to readback buffers.
+    for (const auto &RB : IS.ReadbackBindings) {
+      ComPtr<ID3D12Resource> Src = RB.Source->getNativeResource();
+      addReadbackBeginBarrier(IS, Src);
+
+      if (auto *Tex =
+              std::get_if<std::shared_ptr<DXTexture>>(&RB.Source->Resource)) {
+        const TextureCreateDesc &Desc = (*Tex)->Desc;
         const D3D12_PLACED_SUBRESOURCE_FOOTPRINT Footprint{
             0, CD3DX12_SUBRESOURCE_FOOTPRINT(
-                   getDXFormat(B.Format, B.Channels), B.OutputProps.Width,
-                   B.OutputProps.Height, 1,
-                   B.OutputProps.Width * B.getElementSize())};
-        for (const ResourceSet &RS : R.second) {
-          if (RS.Readback == nullptr)
-            continue;
-          addReadbackBeginBarrier(IS, RS.Buffer);
-          const CD3DX12_TEXTURE_COPY_LOCATION DstLoc(RS.Readback.Get(),
-                                                     Footprint);
-          const CD3DX12_TEXTURE_COPY_LOCATION SrcLoc(RS.Buffer.Get(), 0);
-          IS.CB->CmdList->CopyTextureRegion(&DstLoc, 0, 0, 0, &SrcLoc, nullptr);
-          addReadbackEndBarrier(IS, RS.Buffer);
-        }
-        return;
+                   getDXGIFormat(Desc.Format), Desc.Width, Desc.Height, 1,
+                   Desc.Width * getFormatSize(Desc.Format))};
+        const CD3DX12_TEXTURE_COPY_LOCATION DstLoc(RB.Destination->Buffer.Get(),
+                                                   Footprint);
+        const CD3DX12_TEXTURE_COPY_LOCATION SrcLoc(Src.Get(), 0);
+        IS.CB->CmdList->CopyTextureRegion(&DstLoc, 0, 0, 0, &SrcLoc, nullptr);
+      } else {
+        IS.CB->CmdList->CopyResource(RB.Destination->Buffer.Get(), Src.Get());
       }
-      for (const ResourceSet &RS : R.second) {
-        if (RS.Readback == nullptr)
-          continue;
-        addReadbackBeginBarrier(IS, RS.Buffer);
-        IS.CB->CmdList->CopyResource(RS.Readback.Get(), RS.Buffer.Get());
-        addReadbackEndBarrier(IS, RS.Buffer);
-      }
-    };
 
-    for (auto &Table : IS.DescTables)
-      for (auto &R : Table.Resources)
-        CopyBackResource(R);
-
-    for (auto &R : IS.RootResources)
-      CopyBackResource(R);
+      addReadbackEndBarrier(IS, Src);
+    }
 
     return llvm::Error::success();
   }

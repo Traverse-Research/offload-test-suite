@@ -27,6 +27,7 @@ enum class BufferUsage {
 
 struct BufferCreateDesc {
   MemoryLocation Location;
+  MemoryBacking Backing;
   BufferUsage Usage;
 };
 
