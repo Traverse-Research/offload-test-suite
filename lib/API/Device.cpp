@@ -77,6 +77,7 @@ offloadtest::createRenderTargetFromCPUBuffer(Device &Dev,
 
   TextureCreateDesc Desc = {};
   Desc.Location = MemoryLocation::GpuOnly;
+  Desc.Backing = MemoryBacking::Automatic;
   Desc.Usage = TextureUsage::RenderTarget;
   Desc.Fmt = *TexFmtOrErr;
   Desc.Width = Buf.OutputProps.Width;
@@ -119,6 +120,7 @@ offloadtest::createDefaultDepthStencilTarget(Device &Dev, uint32_t Width,
                                              uint32_t Height) {
   TextureCreateDesc Desc = {};
   Desc.Location = MemoryLocation::GpuOnly;
+  Desc.Backing = MemoryBacking::Automatic;
   Desc.Usage = TextureUsage::DepthStencil;
   Desc.Fmt = Format::D32FloatS8Uint;
   Desc.Width = Width;

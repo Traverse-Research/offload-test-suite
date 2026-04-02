@@ -77,13 +77,13 @@ inline VkFormat getVulkanFormat(Format Format) {
 inline VkImageUsageFlags getVulkanImageUsage(TextureUsage Usage) {
   VkImageUsageFlags Flags =
       VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-  if ((Usage & Sampled) != 0)
+  if ((Usage & TextureUsage::Sampled) != TextureUsage::None)
     Flags |= VK_IMAGE_USAGE_SAMPLED_BIT;
-  if ((Usage & Storage) != 0)
+  if ((Usage & TextureUsage::Storage) != TextureUsage::None)
     Flags |= VK_IMAGE_USAGE_STORAGE_BIT;
-  if ((Usage & RenderTarget) != 0)
+  if ((Usage & TextureUsage::RenderTarget) != TextureUsage::None)
     Flags |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-  if ((Usage & DepthStencil) != 0)
+  if ((Usage & TextureUsage::DepthStencil) != TextureUsage::None)
     Flags |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
   return Flags;
 }

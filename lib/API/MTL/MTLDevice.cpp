@@ -196,6 +196,8 @@ public:
   MTLTexture(MTL::Texture *Tex, llvm::StringRef Name, TextureCreateDesc Desc)
       : offloadtest::Texture(GPUAPI::Metal), Tex(Tex), Name(Name), Desc(Desc) {}
 
+  const TextureCreateDesc &getDesc() const override { return Desc; }
+
   ~MTLTexture() override {
     if (Tex)
       Tex->release();
@@ -619,6 +621,7 @@ class MTLDevice : public offloadtest::Device {
     // Create a readback buffer for copying render target data to the CPU.
     BufferCreateDesc BufDesc = {};
     BufDesc.Location = MemoryLocation::GpuToCpu;
+    BufDesc.Backing = MemoryBacking::Automatic;
     BufDesc.Usage = BufferUsage::Storage;
     auto BufOrErr = createBuffer("RTReadback", BufDesc, OutBuf.size());
     if (!BufOrErr)

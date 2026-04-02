@@ -20,14 +20,19 @@
 
 namespace offloadtest {
 
-enum class BufferUsage {
+enum class BufferUsage : uint32_t {
   Storage,
+  ConstantBuffer,
+  IndexBuffer,
   VertexBuffer,
+  IndirectArgs,
 };
 
 struct BufferCreateDesc {
   MemoryLocation Location;
+  MemoryBacking Backing;
   BufferUsage Usage;
+  bool HasCounter;
 };
 
 class Buffer {
@@ -35,7 +40,6 @@ class Buffer {
 
 public:
   virtual ~Buffer();
-  virtual size_t getSizeInBytes() const = 0;
 
   // Maps the buffer's memory for host access. Only valid for CpuToGpu and
   // GpuToCpu buffers; returns an error for GpuOnly. Each successful map() must
@@ -45,6 +49,8 @@ public:
 
   Buffer(const Buffer &) = delete;
   Buffer &operator=(const Buffer &) = delete;
+
+  virtual size_t getSizeInBytes() const = 0;
 
   GPUAPI getAPI() const { return API; }
 

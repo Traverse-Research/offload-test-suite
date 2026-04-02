@@ -453,6 +453,8 @@ public:
       : offloadtest::Texture(GPUAPI::Vulkan), Dev(Dev), Image(Image),
         Memory(Memory), Name(Name), Desc(Desc) {}
 
+  const TextureCreateDesc &getDesc() const override { return Desc; }
+
   ~VulkanTexture() override {
     if (View)
       vkDestroyImageView(Dev, View, nullptr);
@@ -1440,16 +1442,29 @@ public:
     BufInfo.size = SizeInBytes;
     BufInfo.usage =
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    BufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
     switch (Desc.Usage) {
     case BufferUsage::Storage:
       BufInfo.usage |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+      break;
+    case BufferUsage::ConstantBuffer:
+      BufInfo.usage |= VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+      break;
+    case BufferUsage::IndexBuffer:
+      BufInfo.usage |=
+          VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
       break;
     case BufferUsage::VertexBuffer:
       BufInfo.usage |= VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
       break;
+    case BufferUsage::IndirectArgs:
+      BufInfo.usage |= VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+      break;
     }
-    BufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
     VkBuffer DeviceBuffer;
     if (auto Err = VK::toError(
@@ -1539,8 +1554,10 @@ public:
     auto Tex = std::make_unique<VulkanTexture>(Device, Image, DeviceMemory,
                                                Name, Desc);
 
-    const bool IsRT = (Desc.Usage & TextureUsage::RenderTarget) != 0;
-    const bool IsDS = (Desc.Usage & TextureUsage::DepthStencil) != 0;
+    const bool IsRT =
+        (Desc.Usage & TextureUsage::RenderTarget) != TextureUsage::None;
+    const bool IsDS =
+        (Desc.Usage & TextureUsage::DepthStencil) != TextureUsage::None;
     if (IsRT || IsDS) {
       VkImageViewCreateInfo ViewCi = {};
       ViewCi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -1900,6 +1917,7 @@ public:
     // Create a host-visible staging buffer for readback.
     BufferCreateDesc BufDesc = {};
     BufDesc.Location = MemoryLocation::GpuToCpu;
+    BufDesc.Backing = MemoryBacking::Automatic;
     BufDesc.Usage = BufferUsage::Storage;
     auto BufOrErr = createBuffer("RTReadback", BufDesc, RTBuf.size());
     if (!BufOrErr)

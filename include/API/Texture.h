@@ -26,10 +26,12 @@
 #include <variant>
 
 namespace offloadtest {
+LLVM_ENABLE_BITMASK_ENUMS_IN_NAMESPACE();
 
-enum TextureUsage : uint32_t {
-  Sampled = 1 << 0,
-  Storage = 1 << 1,
+enum class TextureUsage : uint32_t {
+  None = 0,
+  Sampled = 1 << 0, // Read-only shader access (SRV).
+  Storage = 1 << 1, // Read-write shader access (UAV).
   RenderTarget = 1 << 2,
   DepthStencil = 1 << 3,
   LLVM_MARK_AS_BITMASK_ENUM(/* LargestValue = */ DepthStencil)
@@ -37,13 +39,13 @@ enum TextureUsage : uint32_t {
 
 inline std::string getTextureUsageName(TextureUsage Usage) {
   std::string Result;
-  if ((Usage & Sampled) != 0)
+  if ((Usage & TextureUsage::Sampled) != TextureUsage::None)
     Result += "Sampled|";
-  if ((Usage & Storage) != 0)
+  if ((Usage & TextureUsage::Storage) != TextureUsage::None)
     Result += "Storage|";
-  if ((Usage & RenderTarget) != 0)
+  if ((Usage & TextureUsage::RenderTarget) != TextureUsage::None)
     Result += "RenderTarget|";
-  if ((Usage & DepthStencil) != 0)
+  if ((Usage & TextureUsage::DepthStencil) != TextureUsage::None)
     Result += "DepthStencil|";
   if (!Result.empty())
     Result.pop_back(); // Remove trailing '|'
@@ -66,6 +68,7 @@ using ClearValue = std::variant<ClearColor, ClearDepthStencil>;
 // and type (e.g. 3D textures cannot be used as DepthStencil).
 struct TextureCreateDesc {
   MemoryLocation Location;
+  MemoryBacking Backing;
   TextureUsage Usage;
   Format Fmt;
   uint32_t Width;
@@ -85,9 +88,17 @@ inline llvm::Error validateTextureCreateDesc(const TextureCreateDesc &Desc) {
         "Format '%s' is not compatible with texture creation.",
         getFormatName(Desc.Fmt).data());
 
+  if (Desc.Backing == MemoryBacking::Sparse &&
+      Desc.Location != MemoryLocation::GpuOnly)
+    return llvm::createStringError(
+        std::errc::invalid_argument,
+        "Sparse textures must use GpuOnly memory location.");
+
   const bool IsDepth = isDepthFormat(Desc.Fmt);
-  const bool IsRT = (Desc.Usage & TextureUsage::RenderTarget) != 0;
-  const bool IsDS = (Desc.Usage & TextureUsage::DepthStencil) != 0;
+  const bool IsRT =
+      (Desc.Usage & TextureUsage::RenderTarget) != TextureUsage::None;
+  const bool IsDS =
+      (Desc.Usage & TextureUsage::DepthStencil) != TextureUsage::None;
 
   // DepthStencil + RenderTarget is not supported.
   if (IsDS && IsRT)
@@ -96,7 +107,7 @@ inline llvm::Error validateTextureCreateDesc(const TextureCreateDesc &Desc) {
         "DepthStencil and RenderTarget are mutually exclusive.");
   // DepthStencil + Storage is a valid but discouraged configuration (poor
   // performance on most hardware). Not supported for now.
-  if (IsDS && (Desc.Usage & TextureUsage::Storage) != 0)
+  if (IsDS && (Desc.Usage & TextureUsage::Storage) != TextureUsage::None)
     return llvm::createStringError(
         std::errc::not_supported,
         "DepthStencil combined with Storage is not yet supported.");
@@ -148,6 +159,13 @@ public:
   virtual ~Texture();
   Texture(const Texture &) = delete;
   Texture &operator=(const Texture &) = delete;
+
+  virtual const TextureCreateDesc &getDesc() const = 0;
+
+  size_t getSizeInBytes() const {
+    const TextureCreateDesc &D = getDesc();
+    return D.Width * D.Height * getFormatSizeInBytes(D.Fmt);
+  }
 
   GPUAPI getAPI() const { return API; }
 

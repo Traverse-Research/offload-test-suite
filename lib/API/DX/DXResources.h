@@ -73,13 +73,13 @@ inline DXGI_FORMAT getDXGIFormat(Format Format) {
   llvm_unreachable("All Format cases handled");
 }
 
-inline D3D12_RESOURCE_FLAGS getDXResourceFlags(TextureUsage Usage) {
+inline D3D12_RESOURCE_FLAGS getDXTextureResourceFlags(TextureUsage Usage) {
   D3D12_RESOURCE_FLAGS Flags = D3D12_RESOURCE_FLAG_NONE;
-  if ((Usage & TextureUsage::Storage) != 0)
+  if ((Usage & TextureUsage::Storage) != TextureUsage::None)
     Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-  if ((Usage & TextureUsage::RenderTarget) != 0)
+  if ((Usage & TextureUsage::RenderTarget) != TextureUsage::None)
     Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-  if ((Usage & TextureUsage::DepthStencil) != 0)
+  if ((Usage & TextureUsage::DepthStencil) != TextureUsage::None)
     Flags |= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
   return Flags;
 }
