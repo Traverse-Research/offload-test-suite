@@ -75,8 +75,8 @@ inline VkFormat getVulkanFormat(Format Format) {
 }
 
 inline VkImageUsageFlags getVulkanImageUsage(TextureUsage Usage) {
-  VkImageUsageFlags Flags = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                            VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  VkImageUsageFlags Flags =
+      VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
   if ((Usage & Sampled) != 0)
     Flags |= VK_IMAGE_USAGE_SAMPLED_BIT;
   if ((Usage & Storage) != 0)
@@ -87,7 +87,6 @@ inline VkImageUsageFlags getVulkanImageUsage(TextureUsage Usage) {
     Flags |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
   return Flags;
 }
-
 
 } // namespace offloadtest
 
