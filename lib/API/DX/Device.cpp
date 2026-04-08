@@ -1197,21 +1197,15 @@ public:
   }
 
   llvm::Error waitForSignal(InvocationState &IS) {
-    // This is a hack but it works since this is all single threaded code.
-    static uint64_t FenceCounter = 0;
-    const uint64_t CurrentCounter = FenceCounter + 1;
+    const uint64_t SignalValue = IS.Fence->nextSignalValue();
     auto *F = static_cast<DXFence *>(IS.Fence.get());
 
     if (auto Err = HR::toError(
-            GraphicsQueue.Queue->Signal(F->Fence.Get(), CurrentCounter),
+            GraphicsQueue.Queue->Signal(F->Fence.Get(), SignalValue),
             "Failed to add signal."))
       return Err;
 
-    if (auto Err = IS.Fence->waitForCompletion(CurrentCounter))
-      return Err;
-
-    FenceCounter = CurrentCounter;
-    return llvm::Error::success();
+    return IS.Fence->waitForCompletion(SignalValue);
   }
 
   llvm::Error executeCommandList(InvocationState &IS) {

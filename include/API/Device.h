@@ -57,8 +57,14 @@ protected:
 };
 
 class Fence {
+  uint64_t Counter = 0;
+
 public:
   virtual ~Fence() {}
+
+  /// Return the next signal value for this fence's timeline.
+  uint64_t nextSignalValue() { return ++Counter; }
+
   virtual uint64_t getFenceValue() = 0;
   virtual llvm::Error waitForCompletion(uint64_t SignalValue) = 0;
 };

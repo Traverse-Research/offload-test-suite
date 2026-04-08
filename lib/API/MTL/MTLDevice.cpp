@@ -512,15 +512,13 @@ class MTLDevice : public offloadtest::Device {
   }
 
   llvm::Error executeCommands(InvocationState &IS) {
-    // This is a hack but it works since this is all single threaded code.
-    static uint64_t FenceCounter = 0;
-    const uint64_t CurrentCounter = FenceCounter + 1;
+    const uint64_t SignalValue = IS.Fence->nextSignalValue();
     auto *F = static_cast<MTLFence *>(IS.Fence.get());
 
-    IS.CmdBuffer->encodeSignalEvent(F->Event, CurrentCounter);
+    IS.CmdBuffer->encodeSignalEvent(F->Event, SignalValue);
     IS.CmdBuffer->commit();
 
-    if (auto Err = IS.Fence->waitForCompletion(CurrentCounter))
+    if (auto Err = IS.Fence->waitForCompletion(SignalValue))
       return Err;
 
     // Check and surface any errors that occurred during execution.
@@ -528,7 +526,6 @@ class MTLDevice : public offloadtest::Device {
     if (CBErr)
       return toError(CBErr);
 
-    FenceCounter = CurrentCounter;
     return llvm::Error::success();
   }
 

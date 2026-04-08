@@ -1223,9 +1223,7 @@ public:
   }
 
   llvm::Error executeCommandBuffer(InvocationState &IS) {
-    // This is a hack but it works since this is all single threaded code.
-    static uint64_t FenceCounter = 0;
-    const uint64_t CurrentCounter = FenceCounter + 1;
+    const uint64_t SignalValue = IS.Fence->nextSignalValue();
 
     if (vkEndCommandBuffer(IS.CmdBuffer))
       return llvm::createStringError(std::errc::device_or_resource_busy,
@@ -1236,7 +1234,7 @@ public:
     VkTimelineSemaphoreSubmitInfo TimelineSubmitInfo = {};
     TimelineSubmitInfo.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
     TimelineSubmitInfo.signalSemaphoreValueCount = 1;
-    TimelineSubmitInfo.pSignalSemaphoreValues = &CurrentCounter;
+    TimelineSubmitInfo.pSignalSemaphoreValues = &SignalValue;
 
     VkSubmitInfo SubmitInfo = {};
     SubmitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -1251,12 +1249,10 @@ public:
       return llvm::createStringError(std::errc::device_or_resource_busy,
                                      "Failed to submit to queue.");
 
-    if (auto Err = IS.Fence->waitForCompletion(CurrentCounter))
+    if (auto Err = IS.Fence->waitForCompletion(SignalValue))
       return Err;
 
     vkFreeCommandBuffers(Device, IS.CmdPool, 1, &IS.CmdBuffer);
-
-    FenceCounter = CurrentCounter;
     return llvm::Error::success();
   }
 
