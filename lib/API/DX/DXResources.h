@@ -73,27 +73,22 @@ inline DXGI_FORMAT getDXGIFormat(Format Format) {
   llvm_unreachable("All Format cases handled");
 }
 
-inline D3D12_RESOURCE_FLAGS getDXResourceFlags(TextureUsage Usage) {
+inline D3D12_RESOURCE_FLAGS getDXTextureResourceFlags(TextureUsage Usage) {
   D3D12_RESOURCE_FLAGS Flags = D3D12_RESOURCE_FLAG_NONE;
-  if ((Usage & TextureUsage::Storage) != 0)
+  if ((Usage & TextureUsage::Storage) != TextureUsage::None)
     Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-  if ((Usage & TextureUsage::RenderTarget) != 0)
+  if ((Usage & TextureUsage::RenderTarget) != TextureUsage::None)
     Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-  if ((Usage & TextureUsage::DepthStencil) != 0)
+  if ((Usage & TextureUsage::DepthStencil) != TextureUsage::None)
     Flags |= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
   return Flags;
 }
 
-inline D3D12_RESOURCE_FLAGS getDXResourceFlags(BufferUsage Usage) {
-  switch (Usage) {
-  case BufferUsage::Storage:
-    return D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-  case BufferUsage::Sampled:
-  case BufferUsage::Constant:
-  case BufferUsage::VertexBuffer:
-    return D3D12_RESOURCE_FLAG_NONE;
-  }
-  llvm_unreachable("All BufferUsage cases handled");
+inline D3D12_RESOURCE_FLAGS getDXBufferResourceFlags(BufferUsage Usage) {
+  D3D12_RESOURCE_FLAGS Flags = D3D12_RESOURCE_FLAG_NONE;
+  if ((Usage & BufferUsage::Storage) != BufferUsage::None)
+    Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  return Flags;
 }
 
 } // namespace offloadtest

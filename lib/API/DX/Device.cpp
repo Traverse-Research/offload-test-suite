@@ -518,6 +518,8 @@ private:
     uint32_t ArrayIndex;                     // Index within resource array.
   };
 
+  // ResourceBundle will contain one BoundResource for a singular resource
+  // or multiple BoundResource for resource array.
   using ResourceBundle = llvm::SmallVector<std::shared_ptr<BoundResource>>;
   using ResourcePair = std::pair<offloadtest::Resource *, ResourceBundle>;
 
@@ -578,9 +580,10 @@ public:
     const D3D12_HEAP_TYPE HeapType = getDXHeapType(Desc.Location);
 
     // Upload and readback heaps do not support resource flags.
-    const D3D12_RESOURCE_FLAGS Flags = HeapType == D3D12_HEAP_TYPE_DEFAULT
-                                           ? getDXResourceFlags(Desc.Usage)
-                                           : D3D12_RESOURCE_FLAG_NONE;
+    const D3D12_RESOURCE_FLAGS Flags =
+        HeapType == D3D12_HEAP_TYPE_DEFAULT
+            ? getDXBufferResourceFlags(Desc.Usage)
+            : D3D12_RESOURCE_FLAG_NONE;
 
     const D3D12_HEAP_PROPERTIES HeapProps = CD3DX12_HEAP_PROPERTIES(HeapType);
     const D3D12_RESOURCE_DESC BufferDesc =
@@ -640,7 +643,7 @@ public:
     TexDesc.SampleDesc.Count = 1;
     TexDesc.Layout = IsSparse ? D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE
                               : D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    TexDesc.Flags = getDXResourceFlags(Desc.Usage);
+    TexDesc.Flags = getDXTextureResourceFlags(Desc.Usage);
 
     const D3D12_CLEAR_VALUE *ClearValuePtr = nullptr;
     D3D12_CLEAR_VALUE ClearValue = {};
@@ -677,9 +680,9 @@ public:
       // So -for clarity- create DS and RT resources in the correct initial
       // state.
       D3D12_RESOURCE_STATES InitialState = D3D12_RESOURCE_STATE_COMMON;
-      if ((Desc.Usage & TextureUsage::DepthStencil) != 0)
+      if ((Desc.Usage & TextureUsage::DepthStencil) != TextureUsage::None)
         InitialState = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-      else if ((Desc.Usage & TextureUsage::RenderTarget) != 0)
+      else if ((Desc.Usage & TextureUsage::RenderTarget) != TextureUsage::None)
         InitialState = D3D12_RESOURCE_STATE_RENDER_TARGET;
 
       if (auto Err = HR::toError(Device->CreateCommittedResource(
@@ -692,8 +695,10 @@ public:
 
     auto Tex = std::make_unique<DXTexture>(DeviceTexture, Name, Desc);
 
-    const bool IsRT = (Desc.Usage & TextureUsage::RenderTarget) != 0;
-    const bool IsDS = (Desc.Usage & TextureUsage::DepthStencil) != 0;
+    const bool IsRT =
+        (Desc.Usage & TextureUsage::RenderTarget) != TextureUsage::None;
+    const bool IsDS =
+        (Desc.Usage & TextureUsage::DepthStencil) != TextureUsage::None;
     if (IsRT || IsDS) {
       D3D12_DESCRIPTOR_HEAP_DESC HeapDesc = {};
       HeapDesc.NumDescriptors = 1;
@@ -937,7 +942,8 @@ public:
     const CD3DX12_TEXTURE_COPY_LOCATION SrcLoc(Src.Buffer.Get(), Footprint);
     CmdList->CopyTextureRegion(&DstLoc, 0, 0, 0, &SrcLoc, nullptr);
     addUploadEndBarrier(CmdList, Dst.Resource,
-                        (Dst.Desc.Usage & TextureUsage::Storage) != 0);
+                        (Dst.Desc.Usage & TextureUsage::Storage) !=
+                            TextureUsage::None);
   }
 
   static void copyBufferToBuffer(ID3D12GraphicsCommandList *CmdList,
@@ -946,7 +952,8 @@ public:
     CmdList->CopyBufferRegion(Dst.Buffer.Get(), 0, Src.Buffer.Get(), 0,
                               Src.SizeInBytes);
     addUploadEndBarrier(CmdList, Dst.Buffer,
-                        Dst.Desc.Usage == BufferUsage::Storage);
+                        (Dst.Desc.Usage & BufferUsage::Storage) !=
+                            BufferUsage::None);
   }
 
   static UINT getNumTiles(std::optional<uint32_t> NumTiles, uint32_t Width) {
@@ -1014,7 +1021,8 @@ public:
     if (!FmtOrErr)
       return FmtOrErr.takeError();
 
-    const char *Name = (Usage & TextureUsage::Storage) != 0 ? "UAV" : "SRV";
+    const char *Name =
+        (Usage & TextureUsage::Storage) != TextureUsage::None ? "UAV" : "SRV";
 
     TextureCreateDesc TexDesc = {};
     TexDesc.Location = MemoryLocation::GpuOnly;
@@ -1047,10 +1055,10 @@ public:
                           InvocationState &IS) {
     size_t Size = R.size();
     const char *Name = "SRV";
-    if (Usage == BufferUsage::Storage) {
+    if ((Usage & BufferUsage::Storage) != BufferUsage::None) {
       Size = getUAVBufferSize(R);
       Name = "UAV";
-    } else if (Usage == BufferUsage::Constant) {
+    } else if ((Usage & BufferUsage::Constant) != BufferUsage::None) {
       Size = getCBVSize(R.size());
       Name = "CBV";
     }
@@ -1085,7 +1093,7 @@ public:
     BufferCreateDesc UploadDesc = {};
     UploadDesc.Location = MemoryLocation::CpuToGpu;
     UploadDesc.Backing = MemoryBacking::Automatic;
-    UploadDesc.Usage = BufferUsage::Storage;
+    UploadDesc.Usage = BufferUsage::None;
     auto UploadOrErr = createBuffer("Upload", UploadDesc, UploadSize);
     if (!UploadOrErr)
       return UploadOrErr.takeError();
@@ -1096,8 +1104,6 @@ public:
                                "Failed to map upload buffer."))
       return Err;
 
-    // This change fixed 12 tests related to counters. Previously counter memory
-    // was not zero-initialized.
     if (UploadSize > DataSize)
       memset(Mapped, 0, UploadSize);
     memcpy(Mapped, Data, DataSize);
@@ -1121,8 +1127,8 @@ public:
     const MemoryBacking Backing =
         R.IsReserved ? MemoryBacking::Sparse : MemoryBacking::Automatic;
 
-    // Map pipeline resource kind to texture/buffer usage.
-    const TextureUsage TexUsage =
+    // Map pipeline resource kind to usage.
+    TextureUsage TexUsage =
         IsUAV ? TextureUsage::Storage : TextureUsage::Sampled;
     BufferUsage BufUsage = IsUAV ? BufferUsage::Storage : BufferUsage::Sampled;
     if (Kind == CBV)
@@ -1134,7 +1140,6 @@ public:
     uint32_t RegOffset = 0;
 
     for (const auto &ResData : R.BufferPtr->Data) {
-      // Create the GPU resource.
       auto BROrErr = R.isTexture()
                          ? createTextureGPUResource(R, TexUsage, Backing, IS)
                          : createBufferGPUResource(R, BufUsage, Backing, IS);
@@ -1162,7 +1167,7 @@ public:
         BufferCreateDesc ReadbackDesc = {};
         ReadbackDesc.Location = MemoryLocation::GpuToCpu;
         ReadbackDesc.Backing = MemoryBacking::Automatic;
-        ReadbackDesc.Usage = BufferUsage::Storage;
+        ReadbackDesc.Usage = BufferUsage::None;
         auto ReadbackOrErr =
             createBuffer("Readback", ReadbackDesc, BR->getSizeInBytes());
         if (!ReadbackOrErr)
@@ -1355,6 +1360,30 @@ public:
     CmdList->ResourceBarrier(1, &Barrier);
   }
 
+  static void copyReadbackBindings(InvocationState &IS) {
+    for (const auto &RB : IS.ReadbackBindings) {
+      ComPtr<ID3D12Resource> Src = RB.Source->getNativeResource();
+      addReadbackBeginBarrier(IS.CmdList.Get(), Src);
+
+      if (auto *Tex =
+              std::get_if<std::shared_ptr<DXTexture>>(&RB.Source->Resource)) {
+        const TextureCreateDesc &Desc = (*Tex)->Desc;
+        const D3D12_PLACED_SUBRESOURCE_FOOTPRINT Footprint{
+            0, CD3DX12_SUBRESOURCE_FOOTPRINT(
+                   getDXGIFormat(Desc.Format), Desc.Width, Desc.Height, 1,
+                   Desc.Width * getFormatSize(Desc.Format))};
+        const CD3DX12_TEXTURE_COPY_LOCATION DstLoc(RB.Destination->Buffer.Get(),
+                                                   Footprint);
+        const CD3DX12_TEXTURE_COPY_LOCATION SrcLoc(Src.Get(), 0);
+        IS.CmdList->CopyTextureRegion(&DstLoc, 0, 0, 0, &SrcLoc, nullptr);
+      } else {
+        IS.CmdList->CopyResource(RB.Destination->Buffer.Get(), Src.Get());
+      }
+
+      addReadbackEndBarrier(IS.CmdList.Get(), Src);
+    }
+  }
+
   llvm::Error createEvent(InvocationState &IS) {
     if (auto Err = HR::toError(Device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
                                                    IID_PPV_ARGS(&IS.Fence)),
@@ -1487,28 +1516,7 @@ public:
 
     IS.CB->CmdList->Dispatch(DispatchSize[0], DispatchSize[1], DispatchSize[2]);
 
-    // Copy UAV results to readback buffers.
-    for (const auto &RB : IS.ReadbackBindings) {
-      ComPtr<ID3D12Resource> Src = RB.Source->getNativeResource();
-      addReadbackBeginBarrier(IS.CmdList.Get(), Src);
-
-      if (auto *Tex =
-              std::get_if<std::shared_ptr<DXTexture>>(&RB.Source->Resource)) {
-        const TextureCreateDesc &Desc = (*Tex)->Desc;
-        const D3D12_PLACED_SUBRESOURCE_FOOTPRINT Footprint{
-            0, CD3DX12_SUBRESOURCE_FOOTPRINT(
-                   getDXGIFormat(Desc.Format), Desc.Width, Desc.Height, 1,
-                   Desc.Width * getFormatSize(Desc.Format))};
-        const CD3DX12_TEXTURE_COPY_LOCATION DstLoc(RB.Destination->Buffer.Get(),
-                                                   Footprint);
-        const CD3DX12_TEXTURE_COPY_LOCATION SrcLoc(Src.Get(), 0);
-        IS.CB->CmdList->CopyTextureRegion(&DstLoc, 0, 0, 0, &SrcLoc, nullptr);
-      } else {
-        IS.CB->CmdList->CopyResource(RB.Destination->Buffer.Get(), Src.Get());
-      }
-
-      addReadbackEndBarrier(IS.CmdList.Get(), Src);
-    }
+    copyReadbackBindings(IS);
 
     return llvm::Error::success();
   }
@@ -1596,7 +1604,7 @@ public:
     BufferCreateDesc BufDesc = {};
     BufDesc.Location = MemoryLocation::GpuToCpu;
     BufDesc.Backing = MemoryBacking::Automatic;
-    BufDesc.Usage = BufferUsage::Storage;
+    BufDesc.Usage = BufferUsage::None;
     auto BufOrErr = createBuffer("RTReadback", BufDesc, OutBuf.size());
     if (!BufOrErr)
       return BufOrErr.takeError();
@@ -1688,8 +1696,7 @@ public:
     PSODesc.SampleMask = UINT_MAX;
     PSODesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     PSODesc.NumRenderTargets = 1;
-    PSODesc.RTVFormats[0] = getDXFormat(P.Bindings.RTargetBufferPtr->Format,
-                                        P.Bindings.RTargetBufferPtr->Channels);
+    PSODesc.RTVFormats[0] = getDXGIFormat(IS.RT->Desc.Format);
     PSODesc.SampleDesc.Count = 1;
 
     if (auto Err = HR::toError(Device->CreateGraphicsPipelineState(
@@ -1731,11 +1738,11 @@ public:
         DS.ViewHandle, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
         DepthCV->Depth, DepthCV->Stencil, 0, nullptr);
 
+    const TextureCreateDesc &RTDesc = IS.RT->Desc;
+
     D3D12_VIEWPORT VP = {};
-    VP.Width =
-        static_cast<float>(P.Bindings.RTargetBufferPtr->OutputProps.Width);
-    VP.Height =
-        static_cast<float>(P.Bindings.RTargetBufferPtr->OutputProps.Height);
+    VP.Width = static_cast<float>(RTDesc.Width);
+    VP.Height = static_cast<float>(RTDesc.Height);
     VP.MinDepth = 0.0f;
     VP.MaxDepth = 1.0f;
     VP.TopLeftX = 0.0f;
@@ -1754,40 +1761,17 @@ public:
         D3D12_RESOURCE_STATE_COPY_SOURCE);
     IS.CB->CmdList->ResourceBarrier(1, &Barrier);
 
-    const CPUBuffer &B = *P.Bindings.RTargetBufferPtr;
     const D3D12_PLACED_SUBRESOURCE_FOOTPRINT Footprint{
-        0,
-        CD3DX12_SUBRESOURCE_FOOTPRINT(
-            getDXFormat(B.Format, B.Channels), B.OutputProps.Width,
-            B.OutputProps.Height, 1, B.OutputProps.Width * B.getElementSize())};
+        0, CD3DX12_SUBRESOURCE_FOOTPRINT(
+               getDXGIFormat(RTDesc.Format), RTDesc.Width, RTDesc.Height, 1,
+               RTDesc.Width * getFormatSize(RTDesc.Format))};
     const CD3DX12_TEXTURE_COPY_LOCATION DstLoc(RTReadback.Buffer.Get(),
                                                Footprint);
     const CD3DX12_TEXTURE_COPY_LOCATION SrcLoc(RT.Resource.Get(), 0);
 
     IS.CB->CmdList->CopyTextureRegion(&DstLoc, 0, 0, 0, &SrcLoc, nullptr);
 
-    // Copy UAV results to readback buffers.
-    for (const auto &RB : IS.ReadbackBindings) {
-      ComPtr<ID3D12Resource> Src = RB.Source->getNativeResource();
-      addReadbackBeginBarrier(IS.CmdList.Get(), Src);
-
-      if (auto *Tex =
-              std::get_if<std::shared_ptr<DXTexture>>(&RB.Source->Resource)) {
-        const TextureCreateDesc &Desc = (*Tex)->Desc;
-        const D3D12_PLACED_SUBRESOURCE_FOOTPRINT Footprint{
-            0, CD3DX12_SUBRESOURCE_FOOTPRINT(
-                   getDXGIFormat(Desc.Format), Desc.Width, Desc.Height, 1,
-                   Desc.Width * getFormatSize(Desc.Format))};
-        const CD3DX12_TEXTURE_COPY_LOCATION DstLoc(RB.Destination->Buffer.Get(),
-                                                   Footprint);
-        const CD3DX12_TEXTURE_COPY_LOCATION SrcLoc(Src.Get(), 0);
-        IS.CB->CmdList->CopyTextureRegion(&DstLoc, 0, 0, 0, &SrcLoc, nullptr);
-      } else {
-        IS.CB->CmdList->CopyResource(RB.Destination->Buffer.Get(), Src.Get());
-      }
-
-      addReadbackEndBarrier(IS.CmdList.Get(), Src);
-    }
+    copyReadbackBindings(IS);
 
     return llvm::Error::success();
   }
@@ -1847,7 +1831,7 @@ public:
       if (auto Err = createGraphicsPSO(P, State))
         return Err;
       llvm::outs() << "Graphics PSO created.\n";
-      if (auto Err = createGraphicsCommands(P, State))
+      if (auto Err = createGraphicsCommands(State))
         return Err;
       llvm::outs() << "Graphics command list created complete.\n";
     }
