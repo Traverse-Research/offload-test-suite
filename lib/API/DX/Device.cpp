@@ -423,11 +423,11 @@ public:
       InitialState = D3D12_RESOURCE_STATE_COPY_DEST;
 
     ComPtr<ID3D12Resource> DeviceBuffer;
-    if (auto Err = HR::toError(Device->CreateCommittedResource(
-                                   &HeapProps, D3D12_HEAP_FLAG_NONE,
-                                   &BufferDesc, InitialState, nullptr,
-                                   IID_PPV_ARGS(&DeviceBuffer)),
-                               "Failed to create buffer."))
+    if (auto Err =
+            HR::toError(Device->CreateCommittedResource(
+                            &HeapProps, D3D12_HEAP_FLAG_NONE, &BufferDesc,
+                            InitialState, nullptr, IID_PPV_ARGS(&DeviceBuffer)),
+                        "Failed to create buffer."))
       return Err;
 
     return std::make_shared<DXBuffer>(DeviceBuffer, Name, Desc, SizeInBytes);

@@ -371,7 +371,7 @@ class MTLDevice : public offloadtest::Device {
     if (TableSize > 0) {
       IS.ArgBuffer =
           Device->newBuffer(TableSize, MTL::ResourceStorageModeManaged);
-      const uint32_t HeapIndex = 0;
+      uint32_t HeapIndex = 0;
       for (auto &D : P.Sets) {
         for (auto &R : D.Resources) {
           if (auto Err = createDescriptor(R, IS, HeapIndex++))
@@ -506,8 +506,8 @@ class MTLDevice : public offloadtest::Device {
     MTL::RenderPassDescriptor *Desc =
         MTL::RenderPassDescriptor::alloc()->init();
 
-    const uint64_t Width = P.Bindings.RTargetBufferPtr->OutputProps.Width;
-    const uint64_t Height = P.Bindings.RTargetBufferPtr->OutputProps.Height;
+    const uint64_t Width = IS.FrameBufferTexture->Desc.Width;
+    const uint64_t Height = IS.FrameBufferTexture->Desc.Height;
 
     // Color attachment.
     auto *CADesc = MTL::RenderPassColorAttachmentDescriptor::alloc()->init();
@@ -576,7 +576,7 @@ class MTLDevice : public offloadtest::Device {
 
     // Blit the render target into the readback buffer for CPU access.
     MTL::BlitCommandEncoder *Blit = IS.CmdBuffer->blitCommandEncoder();
-    const size_t ElemSize = RTarget->getElementSize();
+    const size_t ElemSize = getFormatSize(IS.FrameBufferTexture->Desc.Format);
     const size_t RowBytes = Width * ElemSize;
     Blit->copyFromTexture(IS.FrameBufferTexture->Tex, 0, 0,
                           MTL::Origin(0, 0, 0), MTL::Size(Width, Height, 1),
@@ -599,8 +599,8 @@ class MTLDevice : public offloadtest::Device {
   }
 
   llvm::Error copyBack(Pipeline &P, InvocationState &IS) {
-    const uint32_t TextureIndex = 0;
-    const uint32_t BufferIndex = 0;
+    uint32_t TextureIndex = 0;
+    uint32_t BufferIndex = 0;
     for (auto &D : P.Sets) {
       for (auto &R : D.Resources) {
         assert(R.BufferPtr->ArraySize == 1 &&
