@@ -435,9 +435,6 @@ private:
     // Current image layout for barrier transitions (VK-specific).
     VkImageLayout CurrentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
-    // Sampler for combined image sampler descriptors (VK-specific).
-    VkSampler Sampler = VK_NULL_HANDLE;
-
     // Device-local counter buffer (VK-specific, for UAV append/consume).
     std::shared_ptr<VulkanBuffer> CounterBuffer;
 
@@ -517,6 +514,12 @@ private:
     llvm::SmallVector<std::shared_ptr<VulkanBuffer>> ResourcesKeepAlive;
     // Readback bindings for copying results back to CPU after execution.
     llvm::SmallVector<ReadbackBinding> ReadbackBindings;
+
+    // All VkSampler handles (standalone + combined). Owns lifetime.
+    llvm::SmallVector<VkSampler> Samplers;
+    // Maps a texture BoundResource to its associated sampler (combined image
+    // sampler descriptors). Non-owning — the sampler is owned by Samplers.
+    llvm::DenseMap<BoundResource *, VkSampler> SamplerBindings;
 
     uint32_t getFullShaderStageMask() {
       if (0 != ShaderStageMask)
@@ -969,16 +972,6 @@ public:
     auto BR = std::make_shared<BoundResource>();
     BR->Resource = Tex;
     BR->CurrentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-
-    // Sampled textures use combined-image-sampler descriptors and need a
-    // sampler handle.
-    if (R.isSampledTexture()) {
-      auto SamplerOrErr = createVkSampler(*R.SamplerPtr);
-      if (!SamplerOrErr)
-        return SamplerOrErr.takeError();
-      BR->Sampler = *SamplerOrErr;
-    }
-
     return BR;
   }
 
@@ -1052,21 +1045,6 @@ public:
                                                           InvocationState &IS) {
     ResourceBundle Bundle;
 
-    // Handle standalone samplers — no backing data, just a VkSampler.
-    if (R.isSampler()) {
-      auto BR = std::make_shared<BoundResource>();
-      // Standalone sampler: no texture/buffer resource, just sampler handle.
-      // Use a null VulkanTexture placeholder.
-      BR->Resource = std::shared_ptr<VulkanTexture>(nullptr);
-
-      auto SamplerOrErr = createVkSampler(*R.SamplerPtr);
-      if (!SamplerOrErr)
-        return SamplerOrErr.takeError();
-      BR->Sampler = *SamplerOrErr;
-      Bundle.push_back(BR);
-      return Bundle;
-    }
-
     // Map resource kind to usage.
     const bool IsReadWrite = R.isReadWrite();
     TextureUsage TexUsage =
@@ -1087,6 +1065,15 @@ public:
       if (!BROrErr)
         return BROrErr.takeError();
       auto BR = *BROrErr;
+
+      // Combined image samplers: create sampler and associate with texture.
+      if (R.isSampledTexture()) {
+        auto SamplerOrErr = createVkSampler(*R.SamplerPtr);
+        if (!SamplerOrErr)
+          return SamplerOrErr.takeError();
+        IS.Samplers.push_back(*SamplerOrErr);
+        IS.SamplerBindings[BR.get()] = *SamplerOrErr;
+      }
 
       // Upload initial data.
       if (auto Err = uploadResourceData(*BR, ResData.get(), R.size(), IS))
@@ -1302,6 +1289,13 @@ public:
   llvm::Error createResources(Pipeline &P, InvocationState &IS) {
     for (auto &D : P.Sets) {
       for (auto &R : D.Resources) {
+        if (R.isSampler()) {
+          auto SamplerOrErr = createVkSampler(*R.SamplerPtr);
+          if (!SamplerOrErr)
+            return SamplerOrErr.takeError();
+          IS.Samplers.push_back(*SamplerOrErr);
+          continue;
+        }
         auto ExRes = createDescriptorResource(R, IS);
         if (!ExRes)
           return ExRes.takeError();
@@ -1546,23 +1540,21 @@ public:
                              BufferViewCount);
     assert(IS.BufferViews.empty());
 
-    uint32_t OverallResIdx = 0;
+    uint32_t ResourceIdx = 0;
+    uint32_t SamplerIdx = 0;
     for (uint32_t SetIdx = 0; SetIdx < P.Sets.size(); ++SetIdx) {
-      for (uint32_t RIdx = 0; RIdx < P.Sets[SetIdx].Resources.size();
-           ++RIdx, ++OverallResIdx) {
+      for (uint32_t RIdx = 0; RIdx < P.Sets[SetIdx].Resources.size(); ++RIdx) {
         const Resource &R = P.Sets[SetIdx].Resources[RIdx];
-        const ResourceBundle &Bundle = IS.Resources[OverallResIdx].second;
         uint32_t IndexOfFirstInArray;
 
         if (R.isSampler()) {
           IndexOfFirstInArray = ImageInfos.size();
-          for (const auto &BR : Bundle) {
-            const VkDescriptorImageInfo ImageInfo = {
-                BR->Sampler, VK_NULL_HANDLE,
-                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-            ImageInfos.push_back(ImageInfo);
-          }
+          const VkDescriptorImageInfo ImageInfo = {
+              IS.Samplers[SamplerIdx++], VK_NULL_HANDLE,
+              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+          ImageInfos.push_back(ImageInfo);
         } else if (R.isTexture()) {
+          const ResourceBundle &Bundle = IS.Resources[ResourceIdx].second;
           IndexOfFirstInArray = ImageInfos.size();
           for (const auto &BR : Bundle) {
             auto &Tex = *std::get<std::shared_ptr<VulkanTexture>>(BR->Resource);
@@ -1589,11 +1581,17 @@ public:
               return llvm::createStringError(std::errc::device_or_resource_busy,
                                              "Failed to create image view.");
             IS.ImageViews.push_back(View);
-            const VkDescriptorImageInfo ImageInfo = {BR->Sampler, View,
+            // Look up sampler from SamplerBindings for combined image samplers.
+            VkSampler Sampler = VK_NULL_HANDLE;
+            auto It = IS.SamplerBindings.find(BR.get());
+            if (It != IS.SamplerBindings.end())
+              Sampler = It->second;
+            const VkDescriptorImageInfo ImageInfo = {Sampler, View,
                                                      VK_IMAGE_LAYOUT_GENERAL};
             ImageInfos.push_back(ImageInfo);
           }
         } else if (R.isRaw()) {
+          const ResourceBundle &Bundle = IS.Resources[ResourceIdx].second;
           IndexOfFirstInArray = BufferInfos.size();
           for (const auto &BR : Bundle) {
             const VkDescriptorBufferInfo BI = {BR->getBuffer(), 0,
@@ -1602,6 +1600,7 @@ public:
           }
         } else {
           // Typed buffer (texel buffer view).
+          const ResourceBundle &Bundle = IS.Resources[ResourceIdx].second;
           VkBufferViewCreateInfo ViewCreateInfo = {};
           ViewCreateInfo.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO;
           ViewCreateInfo.format =
@@ -1631,29 +1630,33 @@ public:
           WDS.pBufferInfo = &BufferInfos[IndexOfFirstInArray];
         else
           WDS.pTexelBufferView = &BufferViews[IndexOfFirstInArray];
-        llvm::outs() << "Updating Descriptor [" << OverallResIdx << "] { "
+        llvm::outs() << "Updating Descriptor [" << ResourceIdx << "] { "
                      << SetIdx << ", " << RIdx << " }\n";
         WriteDescriptors.push_back(WDS);
 
-        if (R.HasCounter) {
-          IndexOfFirstInArray = BufferInfos.size();
-          for (const auto &BR : Bundle) {
-            const VkDescriptorBufferInfo BI = {BR->CounterBuffer->Buffer, 0,
-                                               VK_WHOLE_SIZE};
-            BufferInfos.push_back(BI);
-          }
+        if (!R.isSampler()) {
+          const ResourceBundle &Bundle = IS.Resources[ResourceIdx].second;
+          if (R.HasCounter) {
+            IndexOfFirstInArray = BufferInfos.size();
+            for (const auto &BR : Bundle) {
+              const VkDescriptorBufferInfo BI = {BR->CounterBuffer->Buffer, 0,
+                                                 VK_WHOLE_SIZE};
+              BufferInfos.push_back(BI);
+            }
 
-          VkWriteDescriptorSet CounterWDS = {};
-          CounterWDS.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-          CounterWDS.dstSet = IS.DescriptorSets[SetIdx];
-          CounterWDS.dstBinding = *R.VKBinding->CounterBinding;
-          CounterWDS.descriptorCount = R.getArraySize();
-          CounterWDS.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-          CounterWDS.pBufferInfo = &BufferInfos[IndexOfFirstInArray];
-          llvm::outs() << "Updating Counter Descriptor [" << OverallResIdx
-                       << "] { " << SetIdx << ", " << RIdx << " }\n";
-          llvm::outs() << "Binding = " << CounterWDS.dstBinding << "\n";
-          WriteDescriptors.push_back(CounterWDS);
+            VkWriteDescriptorSet CounterWDS = {};
+            CounterWDS.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            CounterWDS.dstSet = IS.DescriptorSets[SetIdx];
+            CounterWDS.dstBinding = *R.VKBinding->CounterBinding;
+            CounterWDS.descriptorCount = R.getArraySize();
+            CounterWDS.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            CounterWDS.pBufferInfo = &BufferInfos[IndexOfFirstInArray];
+            llvm::outs() << "Updating Counter Descriptor [" << ResourceIdx
+                         << "] { " << SetIdx << ", " << RIdx << " }\n";
+            llvm::outs() << "Binding = " << CounterWDS.dstBinding << "\n";
+            WriteDescriptors.push_back(CounterWDS);
+          }
+          ResourceIdx++;
         }
       }
     }
@@ -2096,9 +2099,8 @@ public:
     return SubRange;
   }
 
-  static void copyBufferToTexture(VkCommandBuffer CmdBuffer,
-                                  VulkanTexture &Dst, VulkanBuffer &Src,
-                                  VkImageLayout OldLayout) {
+  static void copyBufferToTexture(VkCommandBuffer CmdBuffer, VulkanTexture &Dst,
+                                  VulkanBuffer &Src, VkImageLayout OldLayout) {
     const auto Regions = getImageCopyRegions(Dst.Desc);
     const auto SubRange = getImageSubresourceRange(Dst.Desc);
 
@@ -2119,8 +2121,8 @@ public:
                            Regions.data());
   }
 
-  static void copyTextureToBuffer(VkCommandBuffer CmdBuffer,
-                                  VulkanBuffer &Dst, VulkanTexture &Src) {
+  static void copyTextureToBuffer(VkCommandBuffer CmdBuffer, VulkanBuffer &Dst,
+                                  VulkanTexture &Src) {
     const auto Regions = getImageCopyRegions(Src.Desc);
     vkCmdCopyImageToBuffer(CmdBuffer, Src.Image, VK_IMAGE_LAYOUT_GENERAL,
                            Dst.Buffer, Regions.size(), Regions.data());
@@ -2200,19 +2202,10 @@ public:
         if (!BR->isTexture() || BR->CurrentLayout == VK_IMAGE_LAYOUT_UNDEFINED)
           continue;
         auto &Tex = *std::get<std::shared_ptr<VulkanTexture>>(BR->Resource);
-        const TextureCreateDesc &Desc = Tex.Desc;
-
-        VkImageSubresourceRange SubRange = {};
-        SubRange.aspectMask = isDepthFormat(Desc.Format)
-                                  ? VK_IMAGE_ASPECT_DEPTH_BIT
-                                  : VK_IMAGE_ASPECT_COLOR_BIT;
-        SubRange.baseMipLevel = 0;
-        SubRange.levelCount = Desc.MipLevels;
-        SubRange.layerCount = 1;
 
         VkImageMemoryBarrier ImageBarrier = {};
         ImageBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        ImageBarrier.subresourceRange = SubRange;
+        ImageBarrier.subresourceRange = getImageSubresourceRange(Tex.Desc);
         ImageBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         ImageBarrier.dstAccessMask =
             VK_ACCESS_SHADER_READ_BIT |
@@ -2318,7 +2311,7 @@ public:
     return llvm::Error::success();
   }
 
-  llvm::Error readBackData(Pipeline &P, InvocationState &IS) {
+  llvm::Error readBack(Pipeline &P, InvocationState &IS) {
     VkMappedMemoryRange Range = {};
     Range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
     Range.offset = 0;
@@ -2331,7 +2324,8 @@ public:
       vkMapMemory(Device, RB.Destination->Memory, 0, VK_WHOLE_SIZE, 0, &Mapped);
       Range.memory = RB.Destination->Memory;
       vkInvalidateMappedMemoryRanges(Device, 1, &Range);
-      memcpy(R->BufferPtr->Data[RB.ArrayIndex].get(), Mapped, R->size());
+      memcpy(R->BufferPtr->Data[RB.ArrayIndex].get(), Mapped,
+             RB.Source->getSizeInBytes());
       vkUnmapMemory(Device, RB.Destination->Memory);
 
       if (RB.Counter) {
@@ -2368,11 +2362,8 @@ public:
     for (auto &V : IS.ImageViews)
       vkDestroyImageView(Device, V, nullptr);
 
-    // Destroy VkSampler handles — these are not owned by VulkanTexture.
-    for (const auto &RP : IS.Resources)
-      for (const auto &BR : RP.second)
-        if (BR->Sampler != VK_NULL_HANDLE)
-          vkDestroySampler(Device, BR->Sampler, nullptr);
+    for (auto S : IS.Samplers)
+      vkDestroySampler(Device, S, nullptr);
 
     // shared_ptr destructors handle VulkanTexture/VulkanBuffer cleanup.
     IS.Resources.clear();
@@ -2454,7 +2445,7 @@ public:
     if (auto Err = executeCommandBuffer(State))
       return Err;
     llvm::outs() << "Executed compute command buffer.\n";
-    if (auto Err = readBackData(P, State))
+    if (auto Err = readBack(P, State))
       return Err;
     llvm::outs() << "Compute pipeline created.\n";
 
