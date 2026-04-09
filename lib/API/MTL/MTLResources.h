@@ -94,13 +94,13 @@ inline MTL::PixelFormat getMetalPixelFormat(Format Format) {
 
 inline MTL::TextureUsage getMetalTextureUsage(TextureUsage Usage) {
   MTL::TextureUsage Flags = MTL::TextureUsageUnknown;
-  if ((Usage & Sampled) != 0)
+  if ((Usage & TextureUsage::Sampled) != TextureUsage::None)
     Flags |= MTL::TextureUsageShaderRead;
-  if ((Usage & Storage) != 0)
+  if ((Usage & TextureUsage::Storage) != TextureUsage::None)
     Flags |= MTL::TextureUsageShaderRead | MTL::TextureUsageShaderWrite;
-  if ((Usage & RenderTarget) != 0)
+  if ((Usage & TextureUsage::RenderTarget) != TextureUsage::None)
     Flags |= MTL::TextureUsageRenderTarget;
-  if ((Usage & DepthStencil) != 0)
+  if ((Usage & TextureUsage::DepthStencil) != TextureUsage::None)
     Flags |= MTL::TextureUsageRenderTarget;
   return Flags;
 }

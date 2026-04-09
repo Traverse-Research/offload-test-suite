@@ -14,13 +14,20 @@
 
 #include "API/Resources.h"
 
-namespace offloadtest {
+#include "llvm/ADT/BitmaskEnum.h"
 
-enum class BufferUsage {
-  Sampled,      // Read-only shader access (SRV).
-  Storage,      // Read-write shader access (UAV).
-  Constant,     // Constant/uniform buffer (CBV).
-  VertexBuffer,
+#include <cstdint>
+
+namespace offloadtest {
+LLVM_ENABLE_BITMASK_ENUMS_IN_NAMESPACE();
+
+enum class BufferUsage : uint32_t {
+  None = 0,
+  Sampled = 1 << 0,      // Read-only shader access (SRV).
+  Storage = 1 << 1,      // Read-write shader access (UAV).
+  Constant = 1 << 2,     // Constant/uniform buffer (CBV).
+  VertexBuffer = 1 << 3, // Vertex buffer.
+  LLVM_MARK_AS_BITMASK_ENUM(/* LargestValue = */ VertexBuffer)
 };
 
 struct BufferCreateDesc {

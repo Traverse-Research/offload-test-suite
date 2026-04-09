@@ -690,15 +690,16 @@ public:
     BufInfo.size = SizeInBytes;
     BufInfo.usage =
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-    switch (Desc.Usage) {
-    case BufferUsage::Storage:
-      BufInfo.usage |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-      break;
-    case BufferUsage::VertexBuffer:
-      BufInfo.usage |= VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+    if ((Desc.Usage & BufferUsage::Sampled) != BufferUsage::None)
+      BufInfo.usage |= VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-      break;
-    }
+    if ((Desc.Usage & BufferUsage::Storage) != BufferUsage::None)
+      BufInfo.usage |= VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
+                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    if ((Desc.Usage & BufferUsage::Constant) != BufferUsage::None)
+      BufInfo.usage |= VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+    if ((Desc.Usage & BufferUsage::VertexBuffer) != BufferUsage::None)
+      BufInfo.usage |= VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
     BufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
     VkBuffer DeviceBuffer;
@@ -783,8 +784,10 @@ public:
     auto Tex = std::make_shared<VulkanTexture>(Device, Image, DeviceMemory,
                                                Name, Desc);
 
-    const bool IsRT = (Desc.Usage & TextureUsage::RenderTarget) != 0;
-    const bool IsDS = (Desc.Usage & TextureUsage::DepthStencil) != 0;
+    const bool IsRT =
+        (Desc.Usage & TextureUsage::RenderTarget) != TextureUsage::None;
+    const bool IsDS =
+        (Desc.Usage & TextureUsage::DepthStencil) != TextureUsage::None;
     if (IsRT || IsDS) {
       VkImageViewCreateInfo ViewCi = {};
       ViewCi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
