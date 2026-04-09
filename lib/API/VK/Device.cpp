@@ -927,8 +927,10 @@ public:
     auto Tex = std::make_unique<VulkanTexture>(Device, Image, DeviceMemory,
                                                Name, Desc);
 
-    const bool IsRT = (Desc.Usage & TextureUsage::RenderTarget) != 0;
-    const bool IsDS = (Desc.Usage & TextureUsage::DepthStencil) != 0;
+    const bool IsRT =
+        (Desc.Usage & TextureUsage::RenderTarget) != TextureUsage::None;
+    const bool IsDS =
+        (Desc.Usage & TextureUsage::DepthStencil) != TextureUsage::None;
     if (IsRT || IsDS) {
       VkImageViewCreateInfo ViewCi = {};
       ViewCi.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
