@@ -111,6 +111,11 @@ static DXGI_FORMAT getRawDXFormat(const Resource &R) {
   return DXGI_FORMAT_UNKNOWN;
 }
 
+// TODO: Counter data is currently packed at the end of the UAV buffer. To
+// unify with VK (which uses a separate counter buffer bound to its own
+// descriptor), switch to passing a separate counter resource via the
+// pCounterResource parameter of CreateUnorderedAccessView. DX12 supports both
+// approaches. This will simplify the unified API abstraction.
 static uint32_t getUAVBufferSize(const Resource &R) {
   return R.HasCounter
              ? llvm::alignTo(R.size(), D3D12_UAV_COUNTER_PLACEMENT_ALIGNMENT) +
@@ -780,6 +785,18 @@ public:
                             TextureUsage::None);
   }
 
+  static void copyTextureToBuffer(ID3D12GraphicsCommandList *CmdList,
+                                  DXBuffer &Dst, DXTexture &Src) {
+    const TextureCreateDesc &Desc = Src.Desc;
+    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT Footprint{
+        0, CD3DX12_SUBRESOURCE_FOOTPRINT(
+               getDXGIFormat(Desc.Format), Desc.Width, Desc.Height, 1,
+               Desc.Width * getFormatSize(Desc.Format))};
+    const CD3DX12_TEXTURE_COPY_LOCATION DstLoc(Dst.Buffer.Get(), Footprint);
+    const CD3DX12_TEXTURE_COPY_LOCATION SrcLoc(Src.Resource.Get(), 0);
+    CmdList->CopyTextureRegion(&DstLoc, 0, 0, 0, &SrcLoc, nullptr);
+  }
+
   static void copyBufferToBuffer(ID3D12GraphicsCommandList *CmdList,
                                  DXBuffer &Dst, DXBuffer &Src) {
     addUploadBeginBarrier(CmdList, Dst.Buffer);
@@ -1201,15 +1218,7 @@ public:
 
       if (auto *Tex =
               std::get_if<std::shared_ptr<DXTexture>>(&RB.Source->Resource)) {
-        const TextureCreateDesc &Desc = (*Tex)->Desc;
-        const D3D12_PLACED_SUBRESOURCE_FOOTPRINT Footprint{
-            0, CD3DX12_SUBRESOURCE_FOOTPRINT(
-                   getDXGIFormat(Desc.Format), Desc.Width, Desc.Height, 1,
-                   Desc.Width * getFormatSize(Desc.Format))};
-        const CD3DX12_TEXTURE_COPY_LOCATION DstLoc(RB.Destination->Buffer.Get(),
-                                                   Footprint);
-        const CD3DX12_TEXTURE_COPY_LOCATION SrcLoc(Src.Get(), 0);
-        IS.CmdList->CopyTextureRegion(&DstLoc, 0, 0, 0, &SrcLoc, nullptr);
+        copyTextureToBuffer(IS.CmdList.Get(), *RB.Destination, **Tex);
       } else {
         IS.CmdList->CopyResource(RB.Destination->Buffer.Get(), Src.Get());
       }
