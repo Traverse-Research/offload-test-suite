@@ -315,7 +315,7 @@ public:
       : ComputeEncoder(GPUAPI::Metal), CmdBuffer(CmdBuffer),
         ComputeEnc(Encoder) {}
 
-  ~MTLComputeEncoder() override = default;
+  ~MTLComputeEncoder() override { endEncoding(); }
 
   static bool classof(const CommandEncoder *E) {
     return E->getAPI() == GPUAPI::Metal;
@@ -380,7 +380,7 @@ public:
     return llvm::Error::success();
   }
 
-  void endEncoding() override {
+  void endEncodingImpl() override {
     if (ComputeEnc) {
       flushBarrier();
       ComputeEnc->popDebugGroup();
