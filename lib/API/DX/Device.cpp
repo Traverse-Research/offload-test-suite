@@ -511,7 +511,11 @@ private:
     ComPtr<ID3D12RootSignature> RootSig;
     ComPtr<ID3D12DescriptorHeap> DescHeap;
     ComPtr<ID3D12PipelineState> PSO;
-    std::unique_ptr<DXCommandBuffer> CB;
+    std::unique_ptr<offloadtest::CommandBuffer> CB;
+
+    DXCommandBuffer &getCB() {
+      return *static_cast<DXCommandBuffer *>(CB.get());
+    }
     std::unique_ptr<offloadtest::Fence> Fence;
 
     // Resources for graphics pipelines.
@@ -871,9 +875,9 @@ public:
       const CD3DX12_TEXTURE_COPY_LOCATION DstLoc(Destination.Get(), 0);
       const CD3DX12_TEXTURE_COPY_LOCATION SrcLoc(Source.Get(), Footprint);
 
-      IS.CB->CmdList->CopyTextureRegion(&DstLoc, 0, 0, 0, &SrcLoc, nullptr);
+      IS.getCB().CmdList->CopyTextureRegion(&DstLoc, 0, 0, 0, &SrcLoc, nullptr);
     } else
-      IS.CB->CmdList->CopyBufferRegion(Destination.Get(), 0, Source.Get(), 0,
+      IS.getCB().CmdList->CopyBufferRegion(Destination.Get(), 0, Source.Get(), 0,
                                        R.size());
     addUploadEndBarrier(IS, Destination, R.isReadWrite());
   }
@@ -1341,7 +1345,7 @@ public:
         {D3D12_RESOURCE_TRANSITION_BARRIER{
             R.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
             D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST}}};
-    IS.CB->CmdList->ResourceBarrier(1, &Barrier);
+    IS.getCB().CmdList->ResourceBarrier(1, &Barrier);
   }
 
   void addUploadEndBarrier(InvocationState &IS, ComPtr<ID3D12Resource> R,
@@ -1354,21 +1358,21 @@ public:
             D3D12_RESOURCE_STATE_COPY_DEST,
             IsUAV ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
                   : D3D12_RESOURCE_STATE_GENERIC_READ}}};
-    IS.CB->CmdList->ResourceBarrier(1, &Barrier);
+    IS.getCB().CmdList->ResourceBarrier(1, &Barrier);
   }
 
   void addReadbackBeginBarrier(InvocationState &IS, ComPtr<ID3D12Resource> R) {
     const D3D12_RESOURCE_BARRIER Barrier = CD3DX12_RESOURCE_BARRIER::Transition(
         R.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_COPY_SOURCE);
-    IS.CB->CmdList->ResourceBarrier(1, &Barrier);
+    IS.getCB().CmdList->ResourceBarrier(1, &Barrier);
   }
 
   void addReadbackEndBarrier(InvocationState &IS, ComPtr<ID3D12Resource> R) {
     const D3D12_RESOURCE_BARRIER Barrier = CD3DX12_RESOURCE_BARRIER::Transition(
         R.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    IS.CB->CmdList->ResourceBarrier(1, &Barrier);
+    IS.getCB().CmdList->ResourceBarrier(1, &Barrier);
   }
 
   // waitForSignal is used for tile mapping synchronization, not command buffer
@@ -1399,11 +1403,11 @@ public:
     CD3DX12_GPU_DESCRIPTOR_HANDLE Handle;
     if (IS.DescHeap) {
       ID3D12DescriptorHeap *const Heaps[] = {IS.DescHeap.Get()};
-      IS.CB->CmdList->SetDescriptorHeaps(1, Heaps);
+      IS.getCB().CmdList->SetDescriptorHeaps(1, Heaps);
       Handle = IS.DescHeap->GetGPUDescriptorHandleForHeapStart();
     }
-    IS.CB->CmdList->SetComputeRootSignature(IS.RootSig.Get());
-    IS.CB->CmdList->SetPipelineState(IS.PSO.Get());
+    IS.getCB().CmdList->SetComputeRootSignature(IS.RootSig.Get());
+    IS.getCB().CmdList->SetPipelineState(IS.PSO.Get());
 
     const uint32_t Inc = Device->GetDescriptorHandleIncrementSize(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
@@ -1423,14 +1427,14 @@ public:
                 "Root constant cannot refer to resource arrays.");
           const uint32_t NumValues =
               Constant.BufferPtr->size() / sizeof(uint32_t);
-          IS.CB->CmdList->SetComputeRoot32BitConstants(
+          IS.getCB().CmdList->SetComputeRoot32BitConstants(
               RootParamIndex++, NumValues,
               Constant.BufferPtr->Data.back().get(), ConstantOffset);
           ConstantOffset += NumValues;
           break;
         }
         case dx::RootParamKind::DescriptorTable:
-          IS.CB->CmdList->SetComputeRootDescriptorTable(RootParamIndex++,
+          IS.getCB().CmdList->SetComputeRootDescriptorTable(RootParamIndex++,
                                                         Handle);
           Handle.Offset(P.Sets[DescriptorTableIndex++].Resources.size(), Inc);
           break;
@@ -1442,17 +1446,17 @@ public:
                 "Root descriptor cannot refer to resource arrays.");
           switch (getDXKind(RootDescIt->first->Kind)) {
           case SRV:
-            IS.CB->CmdList->SetComputeRootShaderResourceView(
+            IS.getCB().CmdList->SetComputeRootShaderResourceView(
                 RootParamIndex++,
                 RootDescIt->second.back().Buffer->GetGPUVirtualAddress());
             break;
           case UAV:
-            IS.CB->CmdList->SetComputeRootUnorderedAccessView(
+            IS.getCB().CmdList->SetComputeRootUnorderedAccessView(
                 RootParamIndex++,
                 RootDescIt->second.back().Buffer->GetGPUVirtualAddress());
             break;
           case CBV:
-            IS.CB->CmdList->SetComputeRootConstantBufferView(
+            IS.getCB().CmdList->SetComputeRootConstantBufferView(
                 RootParamIndex++,
                 RootDescIt->second.back().Buffer->GetGPUVirtualAddress());
             break;
@@ -1468,7 +1472,7 @@ public:
       // descriptor set layout. This is to make it easier to write tests that
       // don't need complicated root signatures.
       for (uint32_t Idx = 0u; Idx < P.Sets.size(); ++Idx) {
-        IS.CB->CmdList->SetComputeRootDescriptorTable(Idx, Handle);
+        IS.getCB().CmdList->SetComputeRootDescriptorTable(Idx, Handle);
         Handle.Offset(P.Sets[Idx].Resources.size(), Inc);
       }
     }
@@ -1476,7 +1480,7 @@ public:
     const llvm::ArrayRef<int> DispatchSize =
         llvm::ArrayRef<int>(P.Shaders[0].DispatchSize);
 
-    IS.CB->CmdList->Dispatch(DispatchSize[0], DispatchSize[1], DispatchSize[2]);
+    IS.getCB().CmdList->Dispatch(DispatchSize[0], DispatchSize[1], DispatchSize[2]);
 
     auto CopyBackResource = [&IS, this](ResourcePair &R) {
       if (R.first->isTexture()) {
@@ -1493,7 +1497,7 @@ public:
           const CD3DX12_TEXTURE_COPY_LOCATION DstLoc(RS.Readback.Get(),
                                                      Footprint);
           const CD3DX12_TEXTURE_COPY_LOCATION SrcLoc(RS.Buffer.Get(), 0);
-          IS.CB->CmdList->CopyTextureRegion(&DstLoc, 0, 0, 0, &SrcLoc, nullptr);
+          IS.getCB().CmdList->CopyTextureRegion(&DstLoc, 0, 0, 0, &SrcLoc, nullptr);
           addReadbackEndBarrier(IS, RS.Buffer);
         }
         return;
@@ -1502,7 +1506,7 @@ public:
         if (RS.Readback == nullptr)
           continue;
         addReadbackBeginBarrier(IS, RS.Buffer);
-        IS.CB->CmdList->CopyResource(RS.Readback.Get(), RS.Buffer.Get());
+        IS.getCB().CmdList->CopyResource(RS.Readback.Get(), RS.Buffer.Get());
         addReadbackEndBarrier(IS, RS.Buffer);
       }
     };
@@ -1662,8 +1666,8 @@ public:
     VBView.SizeInBytes = static_cast<UINT>(VBSize);
     VBView.StrideInBytes = P.Bindings.getVertexStride();
 
-    IS.CB->CmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    IS.CB->CmdList->IASetVertexBuffers(0, 1, &VBView);
+    IS.getCB().CmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    IS.getCB().CmdList->IASetVertexBuffers(0, 1, &VBView);
 
     return llvm::Error::success();
   }
@@ -1729,16 +1733,16 @@ public:
   }
 
   llvm::Error createGraphicsCommands(Pipeline &P, InvocationState &IS) {
-    IS.CB->CmdList->SetGraphicsRootSignature(IS.RootSig.Get());
+    IS.getCB().CmdList->SetGraphicsRootSignature(IS.RootSig.Get());
     if (IS.DescHeap) {
       ID3D12DescriptorHeap *const Heaps[] = {IS.DescHeap.Get()};
-      IS.CB->CmdList->SetDescriptorHeaps(1, Heaps);
-      IS.CB->CmdList->SetGraphicsRootDescriptorTable(
+      IS.getCB().CmdList->SetDescriptorHeaps(1, Heaps);
+      IS.getCB().CmdList->SetGraphicsRootDescriptorTable(
           0, IS.DescHeap->GetGPUDescriptorHandleForHeapStart());
     }
-    IS.CB->CmdList->SetPipelineState(IS.PSO.Get());
+    IS.getCB().CmdList->SetPipelineState(IS.PSO.Get());
 
-    IS.CB->CmdList->OMSetRenderTargets(1, &IS.RT->ViewHandle, false,
+    IS.getCB().CmdList->OMSetRenderTargets(1, &IS.RT->ViewHandle, false,
                                        &IS.DS->ViewHandle);
 
     const auto *DepthCV =
@@ -1747,7 +1751,7 @@ public:
       return llvm::createStringError(
           std::errc::invalid_argument,
           "Depth/stencil clear value must be a ClearDepthStencil.");
-    IS.CB->CmdList->ClearDepthStencilView(
+    IS.getCB().CmdList->ClearDepthStencilView(
         IS.DS->ViewHandle, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
         DepthCV->Depth, DepthCV->Stencil, 0, nullptr);
 
@@ -1760,19 +1764,19 @@ public:
     VP.MaxDepth = 1.0f;
     VP.TopLeftX = 0.0f;
     VP.TopLeftY = 0.0f;
-    IS.CB->CmdList->RSSetViewports(1, &VP);
+    IS.getCB().CmdList->RSSetViewports(1, &VP);
     const D3D12_RECT Scissor = {0, 0, static_cast<LONG>(VP.Width),
                                 static_cast<LONG>(VP.Height)};
-    IS.CB->CmdList->RSSetScissorRects(1, &Scissor);
+    IS.getCB().CmdList->RSSetScissorRects(1, &Scissor);
 
-    IS.CB->CmdList->DrawInstanced(P.Bindings.getVertexCount(), 1, 0, 0);
+    IS.getCB().CmdList->DrawInstanced(P.Bindings.getVertexCount(), 1, 0, 0);
 
     // Transition the render target to copy source and copy to the readback
     // buffer.
     const D3D12_RESOURCE_BARRIER Barrier = CD3DX12_RESOURCE_BARRIER::Transition(
         IS.RT->Resource.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
         D3D12_RESOURCE_STATE_COPY_SOURCE);
-    IS.CB->CmdList->ResourceBarrier(1, &Barrier);
+    IS.getCB().CmdList->ResourceBarrier(1, &Barrier);
 
     const CPUBuffer &B = *P.Bindings.RTargetBufferPtr;
     const D3D12_PLACED_SUBRESOURCE_FOOTPRINT Footprint{
@@ -1784,7 +1788,7 @@ public:
                                                Footprint);
     const CD3DX12_TEXTURE_COPY_LOCATION SrcLoc(IS.RT->Resource.Get(), 0);
 
-    IS.CB->CmdList->CopyTextureRegion(&DstLoc, 0, 0, 0, &SrcLoc, nullptr);
+    IS.getCB().CmdList->CopyTextureRegion(&DstLoc, 0, 0, 0, &SrcLoc, nullptr);
 
     auto CopyBackResource = [&IS, this](ResourcePair &R) {
       if (R.first->isTexture()) {
@@ -1801,7 +1805,7 @@ public:
           const CD3DX12_TEXTURE_COPY_LOCATION DstLoc(RS.Readback.Get(),
                                                      Footprint);
           const CD3DX12_TEXTURE_COPY_LOCATION SrcLoc(RS.Buffer.Get(), 0);
-          IS.CB->CmdList->CopyTextureRegion(&DstLoc, 0, 0, 0, &SrcLoc, nullptr);
+          IS.getCB().CmdList->CopyTextureRegion(&DstLoc, 0, 0, 0, &SrcLoc, nullptr);
           addReadbackEndBarrier(IS, RS.Buffer);
         }
         return;
@@ -1810,7 +1814,7 @@ public:
         if (RS.Readback == nullptr)
           continue;
         addReadbackBeginBarrier(IS, RS.Buffer);
-        IS.CB->CmdList->CopyResource(RS.Readback.Get(), RS.Buffer.Get());
+        IS.getCB().CmdList->CopyResource(RS.Readback.Get(), RS.Buffer.Get());
         addReadbackEndBarrier(IS, RS.Buffer);
       }
     };

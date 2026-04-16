@@ -222,7 +222,11 @@ class MTLDevice : public offloadtest::Device {
     std::shared_ptr<MTLTexture> FrameBufferTexture;
     std::shared_ptr<MTLBuffer> FrameBufferReadback;
     std::shared_ptr<MTLTexture> DepthStencil;
-    std::unique_ptr<MTLCommandBuffer> CB;
+    std::unique_ptr<offloadtest::CommandBuffer> CB;
+
+    MTLCommandBuffer &getCB() {
+      return *static_cast<MTLCommandBuffer *>(CB.get());
+    }
     std::unique_ptr<offloadtest::Fence> Fence;
   };
 
@@ -469,7 +473,7 @@ class MTLDevice : public offloadtest::Device {
 
   llvm::Error createComputeCommands(Pipeline &P, InvocationState &IS) {
     MTL::ComputeCommandEncoder *CmdEncoder =
-        IS.CB->CmdBuffer->computeCommandEncoder();
+        IS.getCB().CmdBuffer->computeCommandEncoder();
 
     auto CloseCommandEncoder =
         llvm::scope_exit([&]() { CmdEncoder->endEncoding(); });
@@ -620,7 +624,7 @@ class MTLDevice : public offloadtest::Device {
     SADesc->setStoreAction(MTL::StoreActionDontCare);
 
     MTL::RenderCommandEncoder *CmdEncoder =
-        IS.CB->CmdBuffer->renderCommandEncoder(Desc);
+        IS.getCB().CmdBuffer->renderCommandEncoder(Desc);
 
     CmdEncoder->setRenderPipelineState(IS.RenderPipeline);
 
@@ -649,7 +653,7 @@ class MTLDevice : public offloadtest::Device {
     CmdEncoder->endEncoding();
 
     // Blit the render target into the readback buffer for CPU access.
-    MTL::BlitCommandEncoder *Blit = IS.CB->CmdBuffer->blitCommandEncoder();
+    MTL::BlitCommandEncoder *Blit = IS.getCB().CmdBuffer->blitCommandEncoder();
     const size_t ElemSize =
         getFormatSizeInBytes(IS.FrameBufferTexture->Desc.Format);
     const size_t RowBytes = Width * ElemSize;
