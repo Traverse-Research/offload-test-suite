@@ -18,10 +18,15 @@
 
 #include "API/API.h"
 
+#include "llvm/ADT/SmallVector.h"
+
+#include <memory>
+
 namespace offloadtest {
 
 class CommandBuffer {
   GPUAPI Kind;
+  llvm::SmallVector<std::shared_ptr<void>> Keepalives;
 
 public:
   explicit CommandBuffer(GPUAPI Kind) : Kind(Kind) {}
@@ -30,6 +35,10 @@ public:
   CommandBuffer &operator=(const CommandBuffer &) = delete;
 
   GPUAPI getKind() const { return Kind; }
+
+  template <typename T> void keepAlive(std::shared_ptr<T> Res) {
+    Keepalives.push_back(std::move(Res));
+  }
 };
 
 } // namespace offloadtest

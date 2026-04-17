@@ -63,12 +63,25 @@ struct SubmitResult {
 };
 
 class Queue {
+  llvm::SmallVector<std::unique_ptr<CommandBuffer>> PendingCBs;
+
 public:
   virtual ~Queue() = 0;
   Queue(const Queue &) = delete;
   Queue &operator=(const Queue &) = delete;
   Queue(Queue &&) = default;
   Queue &operator=(Queue &&) = default;
+
+  void enqueue(std::unique_ptr<CommandBuffer> CB) {
+    PendingCBs.push_back(std::move(CB));
+  }
+
+  void drainPendingCBs() {
+    // TODO: Check fences before clearing.
+    PendingCBs.clear();
+  }
+
+  void waitForIdle() { drainPendingCBs(); }
 
   /// Submit command buffers for GPU execution.  Returns a fence + value that
   /// the caller can wait on; the call itself does not block.
