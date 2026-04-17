@@ -75,22 +75,6 @@ static MTL::VertexFormat getMTLVertexFormat(DataFormat Format, int Channels) {
 }
 
 namespace {
-class MTLQueue : public offloadtest::Queue {
-public:
-  using Queue::submit;
-
-  MTL::CommandQueue *Queue;
-  MTLQueue(MTL::CommandQueue *Queue) : Queue(Queue) {}
-  ~MTLQueue() override {
-    if (Queue)
-      Queue->release();
-  }
-
-  llvm::Error
-  submit(llvm::SmallVector<std::unique_ptr<offloadtest::CommandBuffer>> CBs)
-      override;
-};
-
 class MTLFence : public offloadtest::Fence {
 public:
   MTLFence(MTL::SharedEvent *Event, llvm::StringRef Name)
@@ -120,6 +104,26 @@ public:
                                      "Timed out waiting on shared event.");
     return llvm::Error::success();
   }
+};
+
+class MTLQueue : public offloadtest::Queue {
+public:
+  using Queue::submit;
+
+  MTL::CommandQueue *Queue;
+  std::unique_ptr<MTLFence> SubmitFence;
+  uint64_t FenceCounter = 0;
+
+  MTLQueue(MTL::CommandQueue *Queue, std::unique_ptr<MTLFence> SubmitFence)
+      : Queue(Queue), SubmitFence(std::move(SubmitFence)) {}
+  ~MTLQueue() override {
+    if (Queue)
+      Queue->release();
+  }
+
+  llvm::Expected<offloadtest::SubmitResult>
+  submit(llvm::SmallVector<std::unique_ptr<offloadtest::CommandBuffer>> CBs)
+      override;
 };
 
 class MTLBuffer : public offloadtest::Buffer {
@@ -178,23 +182,21 @@ private:
   MTLCommandBuffer() : CommandBuffer(GPUAPI::Metal) {}
 };
 
-llvm::Error MTLQueue::submit(
+llvm::Expected<offloadtest::SubmitResult> MTLQueue::submit(
     llvm::SmallVector<std::unique_ptr<offloadtest::CommandBuffer>> CBs) {
   // Metal serial queues guarantee that command buffers execute in commit order,
   // so no explicit wait on prior work is needed here.
-  for (auto &CB : CBs)
-    llvm::cast<MTLCommandBuffer>(CB.get())->CmdBuffer->commit();
+  const uint64_t SignalValue = ++FenceCounter;
 
-  // TODO: Return a Fence+value with keepalive lists instead of blocking here.
-  for (auto &CB : CBs) {
-    auto &MCB = *llvm::cast<MTLCommandBuffer>(CB.get());
-    MCB.CmdBuffer->waitUntilCompleted();
-
-    NS::Error *Err = MCB.CmdBuffer->error();
-    if (Err)
-      return toError(Err);
+  for (size_t I = 0; I < CBs.size(); ++I) {
+    auto &MCB = *llvm::cast<MTLCommandBuffer>(CBs[I].get());
+    // Signal the submit fence when the last command buffer completes.
+    if (I == CBs.size() - 1)
+      MCB.CmdBuffer->encodeSignalEvent(SubmitFence->Event, SignalValue);
+    MCB.CmdBuffer->commit();
   }
-  return llvm::Error::success();
+
+  return offloadtest::SubmitResult{SubmitFence.get(), SignalValue};
 }
 class MTLDevice : public offloadtest::Device {
   Capabilities Caps;
@@ -228,7 +230,6 @@ class MTLDevice : public offloadtest::Device {
     std::shared_ptr<MTLBuffer> FrameBufferReadback;
     std::shared_ptr<MTLTexture> DepthStencil;
     std::unique_ptr<MTLCommandBuffer> CB;
-    std::unique_ptr<offloadtest::Fence> Fence;
   };
 
   llvm::Error setupVertexShader(InvocationState &IS, const Pipeline &P,
@@ -666,7 +667,8 @@ class MTLDevice : public offloadtest::Device {
     return llvm::Error::success();
   }
 
-  llvm::Error executeCommands(InvocationState &IS) {
+  llvm::Expected<offloadtest::SubmitResult>
+  executeCommands(InvocationState &IS) {
     return GraphicsQueue.submit(std::move(IS.CB));
   }
 
@@ -720,8 +722,9 @@ class MTLDevice : public offloadtest::Device {
   }
 
 public:
-  MTLDevice(MTL::Device *D, MTL::CommandQueue *Q)
-      : Device(D), GraphicsQueue(MTLQueue(Q)) {
+  MTLDevice(MTL::Device *D, MTL::CommandQueue *Q,
+            std::unique_ptr<MTLFence> SubmitFence)
+      : Device(D), GraphicsQueue(Q, std::move(SubmitFence)) {
     Description = Device->name()->utf8String();
   }
   const Capabilities &getCapabilities() override {
@@ -783,11 +786,6 @@ public:
       return CBOrErr.takeError();
     IS.CB = std::move(*CBOrErr);
 
-    auto FenceOrErr = createFence("Fence");
-    if (!FenceOrErr)
-      return FenceOrErr.takeError();
-    IS.Fence = std::move(*FenceOrErr);
-
     if (auto Err = createBuffers(P, IS))
       return Err;
 
@@ -804,7 +802,11 @@ public:
       llvm::outs() << "Created graphics commands.\n";
     }
 
-    if (auto Err = executeCommands(IS))
+    auto SubmitResult = executeCommands(IS);
+    if (!SubmitResult)
+      return SubmitResult.takeError();
+
+    if (auto Err = SubmitResult->waitForCompletion())
       return Err;
 
     if (auto Err = copyBack(P, IS))
@@ -825,7 +827,12 @@ llvm::Error offloadtest::initializeMetalDevices(
   MTL::Device *MetalDevice = MTL::CreateSystemDefaultDevice();
   MTL::CommandQueue *MetalQueue = MetalDevice->newCommandQueue();
 
-  auto DefaultDev = std::make_unique<MTLDevice>(MetalDevice, MetalQueue);
+  auto SubmitFenceOrErr = MTLFence::create(MetalDevice, "QueueSubmitFence");
+  if (!SubmitFenceOrErr)
+    return SubmitFenceOrErr.takeError();
+
+  auto DefaultDev = std::make_unique<MTLDevice>(MetalDevice, MetalQueue,
+                                                std::move(*SubmitFenceOrErr));
   Devices.push_back(std::move(DefaultDev));
 
   return llvm::Error::success();
