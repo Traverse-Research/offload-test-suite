@@ -26,17 +26,8 @@ enum class MemoryLocation {
 };
 
 enum class MemoryBacking {
-  // Runtime allocates all memory for this resource.
-  // DX: CreateCommittedResource.
-  // VK: vkAllocateMemory + vkBindImageMemory.
-  // Metal: MTLDevice::newTexture / MTLDevice::newBuffer.
+  // Allocates all memory for this resource.
   Automatic,
-  // TODO:
-  // Resource placed within a caller-managed memory pool.
-  // DX: CreatePlacedResource.
-  // VK: vkBindImageMemory at an offset within a pre-existing VkDeviceMemory.
-  // Metal: MTLHeap::newTexture / MTLHeap::newBuffer.
-  // Pooled,
 
   // No memory allocated; physical pages mapped manually on demand.
   // DX: CreateReservedResource + UpdateTileMappings.
