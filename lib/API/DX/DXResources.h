@@ -84,13 +84,6 @@ inline D3D12_RESOURCE_FLAGS getDXTextureResourceFlags(TextureUsage Usage) {
   return Flags;
 }
 
-inline D3D12_RESOURCE_FLAGS getDXBufferResourceFlags(BufferUsage Usage) {
-  D3D12_RESOURCE_FLAGS Flags = D3D12_RESOURCE_FLAG_NONE;
-  if ((Usage & BufferUsage::Storage) != BufferUsage::None)
-    Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-  return Flags;
-}
-
 } // namespace offloadtest
 
 #endif // OFFLOADTEST_API_DXRESOURCES_H
