@@ -33,6 +33,7 @@
 
 #include "API/Capabilities.h"
 #include "API/Device.h"
+#include "API/FormatConversion.h"
 #include "DXFeatures.h"
 #include "Support/Pipeline.h"
 #include "Support/WinError.h"
@@ -137,13 +138,6 @@ static DXGI_FORMAT getRawDXFormat(const Resource &R) {
     llvm_unreachable("Unsupported Resource format specified");
   }
   return DXGI_FORMAT_UNKNOWN;
-}
-
-static uint32_t getUAVBufferSize(const Resource &R) {
-  return R.HasCounter
-             ? llvm::alignTo(R.size(), D3D12_UAV_COUNTER_PLACEMENT_ALIGNMENT) +
-                   sizeof(uint32_t)
-             : R.size();
 }
 
 static uint32_t getUAVBufferCounterOffset(const Resource &R) {
@@ -630,13 +624,24 @@ public:
                size_t SizeInBytes) override {
     const D3D12_HEAP_TYPE HeapType = getDXHeapType(Desc.Location);
 
-    // Upload and readback heaps do not support resource flags.
-    const D3D12_RESOURCE_FLAGS Flags =
-        HeapType == D3D12_HEAP_TYPE_DEFAULT
-            ? getDXBufferResourceFlags(Desc.Usage)
-            : D3D12_RESOURCE_FLAG_NONE;
-
     const D3D12_HEAP_PROPERTIES HeapProps = CD3DX12_HEAP_PROPERTIES(HeapType);
+    // This flag is only allowed on GpuOnly memory.
+    const D3D12_RESOURCE_FLAGS Flags =
+        Desc.Location == MemoryLocation::GpuOnly
+            ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+            : D3D12_RESOURCE_FLAG_NONE;
+    // Modify the size if needed
+    if (Desc.Usage == BufferUsage::ConstantBuffer) {
+      assert(!Desc.HasCounter &&
+             "Constant Buffers are not allowed to have a counter.");
+      SizeInBytes = getCBVSize(SizeInBytes);
+    } else if (Desc.HasCounter) {
+      const size_t A = SizeInBytes;
+      SizeInBytes =
+          llvm::alignTo(SizeInBytes, D3D12_UAV_COUNTER_PLACEMENT_ALIGNMENT) +
+          sizeof(uint32_t);
+    }
+
     const D3D12_RESOURCE_DESC BufferDesc =
         CD3DX12_RESOURCE_DESC::Buffer(SizeInBytes, Flags);
 
@@ -666,7 +671,10 @@ public:
         return Err;
     }
 
-    return std::make_unique<DXBuffer>(DeviceBuffer, Name, Desc, SizeInBytes);
+    const std::wstring WStr(Name.begin(), Name.end());
+    DeviceBuffer->SetName(WStr.c_str());
+
+    return std::make_shared<DXBuffer>(DeviceBuffer, Name, Desc, SizeInBytes);
   }
 
   llvm::Expected<std::unique_ptr<offloadtest::Texture>>
@@ -995,8 +1003,8 @@ public:
     addUploadBeginBarrier(CmdList, Dst.Resource);
     const D3D12_PLACED_SUBRESOURCE_FOOTPRINT Footprint{
         0, CD3DX12_SUBRESOURCE_FOOTPRINT(
-               getDXGIFormat(Dst.Desc.Format), Dst.Desc.Width, Dst.Desc.Height,
-               1, Dst.Desc.Width * getFormatSize(Dst.Desc.Format))};
+               getDXGIFormat(Dst.Desc.Fmt), Dst.Desc.Width, Dst.Desc.Height, 1,
+               Dst.Desc.Width * getFormatSizeInBytes(Dst.Desc.Fmt))};
     const CD3DX12_TEXTURE_COPY_LOCATION DstLoc(Dst.Resource.Get(), 0);
     const CD3DX12_TEXTURE_COPY_LOCATION SrcLoc(Src.Buffer.Get(), Footprint);
     CmdList->CopyTextureRegion(&DstLoc, 0, 0, 0, &SrcLoc, nullptr);
@@ -1006,13 +1014,12 @@ public:
   }
 
   static void copyBufferToBuffer(ID3D12GraphicsCommandList *CmdList,
-                                 DXBuffer &Dst, DXBuffer &Src) {
+                                 DXBuffer &Dst, DXBuffer &Src,
+                                 bool PutInWriteState) {
     addUploadBeginBarrier(CmdList, Dst.Buffer);
     CmdList->CopyBufferRegion(Dst.Buffer.Get(), 0, Src.Buffer.Get(), 0,
                               Src.SizeInBytes);
-    addUploadEndBarrier(CmdList, Dst.Buffer,
-                        (Dst.Desc.Usage & BufferUsage::Storage) !=
-                            BufferUsage::None);
+    addUploadEndBarrier(CmdList, Dst.Buffer, PutInWriteState);
   }
 
   static UINT getNumTiles(std::optional<uint32_t> NumTiles, uint32_t Width) {
@@ -1073,21 +1080,18 @@ public:
   }
 
   llvm::Expected<std::shared_ptr<BoundResource>>
-  createTextureGPUResource(Resource &R, TextureUsage Usage,
+  createTextureGPUResource(Resource &R, const char *Name, TextureUsage Usage,
                            MemoryBacking Backing, InvocationState &IS) {
     const CPUBuffer &B = *R.BufferPtr;
     auto FmtOrErr = toFormat(B.Format, B.Channels);
     if (!FmtOrErr)
       return FmtOrErr.takeError();
 
-    const char *Name =
-        (Usage & TextureUsage::Storage) != TextureUsage::None ? "UAV" : "SRV";
-
     TextureCreateDesc TexDesc = {};
     TexDesc.Location = MemoryLocation::GpuOnly;
     TexDesc.Backing = Backing;
     TexDesc.Usage = Usage;
-    TexDesc.Format = *FmtOrErr;
+    TexDesc.Fmt = *FmtOrErr;
     TexDesc.Width = B.OutputProps.Width;
     TexDesc.Height = B.OutputProps.Height;
     TexDesc.MipLevels = B.OutputProps.MipLevels;
@@ -1098,7 +1102,7 @@ public:
     auto Tex = std::static_pointer_cast<DXTexture>(*TexOrErr);
 
     if (R.IsReserved) {
-      D3D12_RESOURCE_DESC NativeDesc = Tex->Resource->GetDesc();
+      const D3D12_RESOURCE_DESC NativeDesc = Tex->Resource->GetDesc();
       if (auto Err = setupReservedResource(R, IS, NativeDesc, Tex->ResourceHeap,
                                            Tex->Resource))
         return Err;
@@ -1110,29 +1114,20 @@ public:
   }
 
   llvm::Expected<std::shared_ptr<BoundResource>>
-  createBufferGPUResource(Resource &R, BufferUsage Usage, MemoryBacking Backing,
-                          InvocationState &IS) {
-    size_t Size = R.size();
-    const char *Name = "SRV";
-    if ((Usage & BufferUsage::Storage) != BufferUsage::None) {
-      Size = getUAVBufferSize(R);
-      Name = "UAV";
-    } else if ((Usage & BufferUsage::Constant) != BufferUsage::None) {
-      Size = getCBVSize(R.size());
-      Name = "CBV";
-    }
-
+  createBufferGPUResource(Resource &R, const char *Name, BufferUsage Usage,
+                          MemoryBacking Backing, InvocationState &IS) {
     BufferCreateDesc BufDesc = {};
     BufDesc.Location = MemoryLocation::GpuOnly;
     BufDesc.Backing = Backing;
     BufDesc.Usage = Usage;
-    auto BufOrErr = createBuffer(Name, BufDesc, Size);
+    BufDesc.HasCounter = R.HasCounter;
+    auto BufOrErr = createBuffer(Name, BufDesc, R.size());
     if (!BufOrErr)
       return BufOrErr.takeError();
     auto Buf = std::static_pointer_cast<DXBuffer>(*BufOrErr);
 
     if (R.IsReserved) {
-      D3D12_RESOURCE_DESC NativeDesc = Buf->Buffer->GetDesc();
+      const D3D12_RESOURCE_DESC NativeDesc = Buf->Buffer->GetDesc();
       if (auto Err = setupReservedResource(R, IS, NativeDesc, Buf->ResourceHeap,
                                            Buf->Buffer))
         return Err;
@@ -1144,7 +1139,8 @@ public:
   }
 
   llvm::Error uploadResourceData(BoundResource &BR, const void *Data,
-                                 size_t DataSize, InvocationState &IS) {
+                                 size_t DataSize, InvocationState &IS,
+                                 bool PutInWriteState) {
     // Upload buffer size matches the destination resource size (which may
     // include UAV counter space or CBV alignment padding).
     const size_t UploadSize = BR.getSizeInBytes();
@@ -1152,7 +1148,7 @@ public:
     BufferCreateDesc UploadDesc = {};
     UploadDesc.Location = MemoryLocation::CpuToGpu;
     UploadDesc.Backing = MemoryBacking::Automatic;
-    UploadDesc.Usage = BufferUsage::None;
+    UploadDesc.Usage = BufferUsage::Storage;
     auto UploadOrErr = createBuffer("Upload", UploadDesc, UploadSize);
     if (!UploadOrErr)
       return UploadOrErr.takeError();
@@ -1169,10 +1165,10 @@ public:
     Upload->Buffer->Unmap(0, nullptr);
 
     if (auto *Tex = std::get_if<std::shared_ptr<DXTexture>>(&BR.Resource)) {
-      copyBufferToTexture(IS.CmdList.Get(), **Tex, *Upload);
+      copyBufferToTexture(IS.CB->CmdList.Get(), **Tex, *Upload);
     } else {
       auto &Buf = *std::get<std::shared_ptr<DXBuffer>>(BR.Resource);
-      copyBufferToBuffer(IS.CmdList.Get(), Buf, *Upload);
+      copyBufferToBuffer(IS.CB->CmdList.Get(), Buf, *Upload, PutInWriteState);
     }
     IS.ResourcesKeepAlive.push_back(Upload);
     return llvm::Error::success();
@@ -1187,11 +1183,11 @@ public:
         R.IsReserved ? MemoryBacking::Sparse : MemoryBacking::Automatic;
 
     // Map pipeline resource kind to usage.
-    TextureUsage TexUsage =
+    const TextureUsage TexUsage =
         IsUAV ? TextureUsage::Storage : TextureUsage::Sampled;
-    BufferUsage BufUsage = IsUAV ? BufferUsage::Storage : BufferUsage::Sampled;
+    BufferUsage BufUsage = BufferUsage::Storage;
     if (Kind == CBV)
-      BufUsage = BufferUsage::Constant;
+      BufUsage = BufferUsage::ConstantBuffer;
 
     const char *KindName = IsUAV ? "UAV" : Kind == CBV ? "CBV" : "SRV";
     const char RegPrefix = IsUAV ? 'u' : Kind == CBV ? 'b' : 't';
@@ -1199,9 +1195,10 @@ public:
     uint32_t RegOffset = 0;
 
     for (const auto &ResData : R.BufferPtr->Data) {
-      auto BROrErr = R.isTexture()
-                         ? createTextureGPUResource(R, TexUsage, Backing, IS)
-                         : createBufferGPUResource(R, BufUsage, Backing, IS);
+      auto BROrErr =
+          R.isTexture()
+              ? createTextureGPUResource(R, KindName, TexUsage, Backing, IS)
+              : createBufferGPUResource(R, KindName, BufUsage, Backing, IS);
       if (!BROrErr)
         return BROrErr.takeError();
       auto BR = *BROrErr;
@@ -1218,7 +1215,9 @@ public:
       llvm::outs() << " }\n";
 
       // Upload initial data.
-      if (auto Err = uploadResourceData(*BR, ResData.get(), R.size(), IS))
+      const bool PutInWriteState = R.isReadWrite();
+      if (auto Err = uploadResourceData(*BR, ResData.get(), R.size(), IS,
+                                        PutInWriteState))
         return Err;
 
       // UAV resources need a readback buffer for copying results back to CPU.
@@ -1226,7 +1225,7 @@ public:
         BufferCreateDesc ReadbackDesc = {};
         ReadbackDesc.Location = MemoryLocation::GpuToCpu;
         ReadbackDesc.Backing = MemoryBacking::Automatic;
-        ReadbackDesc.Usage = BufferUsage::None;
+        ReadbackDesc.Usage = BufferUsage::Storage;
         auto ReadbackOrErr =
             createBuffer("Readback", ReadbackDesc, BR->getSizeInBytes());
         if (!ReadbackOrErr)
@@ -1282,7 +1281,7 @@ public:
 
       D3D12_CPU_DESCRIPTOR_HANDLE UAVHandle = UAVHandleHeapStart;
       UAVHandle.ptr += HeapIdx * DescHandleIncSize;
-      ComPtr<ID3D12Resource> Native = BR->getNativeResource();
+      const ComPtr<ID3D12Resource> Native = BR->getNativeResource();
       ID3D12Resource *CounterBuffer = R.HasCounter ? Native.Get() : nullptr;
       Device->CreateUnorderedAccessView(Native.Get(), CounterBuffer, &UAVDesc,
                                         UAVHandle);
@@ -1391,15 +1390,16 @@ public:
   }
 
   static void addUploadEndBarrier(ID3D12GraphicsCommandList *CmdList,
-                                  ComPtr<ID3D12Resource> R, bool IsUAV) {
+                                  ComPtr<ID3D12Resource> R,
+                                  bool PutInWriteState) {
     const D3D12_RESOURCE_BARRIER Barrier = {
         D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
         D3D12_RESOURCE_BARRIER_FLAG_NONE,
         {D3D12_RESOURCE_TRANSITION_BARRIER{
             R.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
             D3D12_RESOURCE_STATE_COPY_DEST,
-            IsUAV ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-                  : D3D12_RESOURCE_STATE_GENERIC_READ}}};
+            PutInWriteState ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
+                            : D3D12_RESOURCE_STATE_GENERIC_READ}}};
     CmdList->ResourceBarrier(1, &Barrier);
   }
 
@@ -1421,43 +1421,26 @@ public:
 
   static void copyReadbackBindings(InvocationState &IS) {
     for (const auto &RB : IS.ReadbackBindings) {
-      ComPtr<ID3D12Resource> Src = RB.Source->getNativeResource();
-      addReadbackBeginBarrier(IS.CmdList.Get(), Src);
+      const ComPtr<ID3D12Resource> Src = RB.Source->getNativeResource();
+      addReadbackBeginBarrier(IS.CB->CmdList.Get(), Src);
 
       if (auto *Tex =
               std::get_if<std::shared_ptr<DXTexture>>(&RB.Source->Resource)) {
         const TextureCreateDesc &Desc = (*Tex)->Desc;
         const D3D12_PLACED_SUBRESOURCE_FOOTPRINT Footprint{
             0, CD3DX12_SUBRESOURCE_FOOTPRINT(
-                   getDXGIFormat(Desc.Format), Desc.Width, Desc.Height, 1,
-                   Desc.Width * getFormatSize(Desc.Format))};
+                   getDXGIFormat(Desc.Fmt), Desc.Width, Desc.Height, 1,
+                   Desc.Width * getFormatSizeInBytes(Desc.Fmt))};
         const CD3DX12_TEXTURE_COPY_LOCATION DstLoc(RB.Destination->Buffer.Get(),
                                                    Footprint);
         const CD3DX12_TEXTURE_COPY_LOCATION SrcLoc(Src.Get(), 0);
-        IS.CmdList->CopyTextureRegion(&DstLoc, 0, 0, 0, &SrcLoc, nullptr);
+        IS.CB->CmdList->CopyTextureRegion(&DstLoc, 0, 0, 0, &SrcLoc, nullptr);
       } else {
-        IS.CmdList->CopyResource(RB.Destination->Buffer.Get(), Src.Get());
+        IS.CB->CmdList->CopyResource(RB.Destination->Buffer.Get(), Src.Get());
       }
 
-      addReadbackEndBarrier(IS.CmdList.Get(), Src);
+      addReadbackEndBarrier(IS.CB->CmdList.Get(), Src);
     }
-  }
-
-  llvm::Error createEvent(InvocationState &IS) {
-    if (auto Err = HR::toError(Device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
-                                                   IID_PPV_ARGS(&IS.Fence)),
-                               "Failed to create fence."))
-      return Err;
-#ifdef _WIN32
-    IS.Event = CreateEventA(nullptr, false, false, nullptr);
-    if (!IS.Event)
-#else // WSL
-    IS.Event = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-    if (IS.Event == -1)
-#endif
-      return llvm::createStringError(std::errc::device_or_resource_busy,
-                                     "Failed to create event.");
-    return llvm::Error::success();
   }
 
   llvm::Error waitForSignal(InvocationState &IS) {
@@ -1582,7 +1565,7 @@ public:
 
   llvm::Error readBack(Pipeline &P, InvocationState &IS) {
     for (const auto &RB : IS.ReadbackBindings) {
-      offloadtest::Resource *R = RB.PipelineResource;
+      const offloadtest::Resource *R = RB.PipelineResource;
       void *DataPtr;
       if (auto Err =
               HR::toError(RB.Destination->Buffer->Map(0, nullptr, &DataPtr),
@@ -1663,7 +1646,7 @@ public:
     BufferCreateDesc BufDesc = {};
     BufDesc.Location = MemoryLocation::GpuToCpu;
     BufDesc.Backing = MemoryBacking::Automatic;
-    BufDesc.Usage = BufferUsage::None;
+    BufDesc.Usage = BufferUsage::Storage;
     auto BufOrErr = createBuffer("RTReadback", BufDesc, OutBuf.size());
     if (!BufOrErr)
       return BufOrErr.takeError();
@@ -1755,7 +1738,7 @@ public:
     PSODesc.SampleMask = UINT_MAX;
     PSODesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     PSODesc.NumRenderTargets = 1;
-    PSODesc.RTVFormats[0] = getDXGIFormat(IS.RT->Desc.Format);
+    PSODesc.RTVFormats[0] = getDXGIFormat(IS.RT->Desc.Fmt);
     PSODesc.SampleDesc.Count = 1;
 
     if (auto Err = HR::toError(Device->CreateGraphicsPipelineState(
@@ -1821,9 +1804,9 @@ public:
 
     const D3D12_PLACED_SUBRESOURCE_FOOTPRINT Footprint{
         0, CD3DX12_SUBRESOURCE_FOOTPRINT(
-               getDXGIFormat(RTDesc.Format), RTDesc.Width, RTDesc.Height, 1,
-               RTDesc.Width * getFormatSize(RTDesc.Format))};
-    const CD3DX12_TEXTURE_COPY_LOCATION DstLoc(RTReadback.Buffer.Get(),
+               getDXGIFormat(RTDesc.Fmt), RTDesc.Width, RTDesc.Height, 1,
+               RTDesc.Width * getFormatSizeInBytes(RTDesc.Fmt))};
+    const CD3DX12_TEXTURE_COPY_LOCATION DstLoc(IS.RTReadback->Buffer.Get(),
                                                Footprint);
     const CD3DX12_TEXTURE_COPY_LOCATION SrcLoc(RT.Resource.Get(), 0);
 
@@ -1889,7 +1872,7 @@ public:
       if (auto Err = createGraphicsPSO(P, State))
         return Err;
       llvm::outs() << "Graphics PSO created.\n";
-      if (auto Err = createGraphicsCommands(State))
+      if (auto Err = createGraphicsCommands(P, State))
         return Err;
       llvm::outs() << "Graphics command list created complete.\n";
     }

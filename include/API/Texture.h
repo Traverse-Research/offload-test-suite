@@ -164,7 +164,7 @@ public:
 
   size_t getSizeInBytes() const {
     const TextureCreateDesc &D = getDesc();
-    return D.Width * D.Height * getFormatSize(D.Format);
+    return D.Width * D.Height * getFormatSizeInBytes(D.Fmt);
   }
 
   GPUAPI getAPI() const { return API; }

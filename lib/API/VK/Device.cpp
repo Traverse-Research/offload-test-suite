@@ -420,6 +420,8 @@ public:
     vkFreeMemory(Dev, Memory, nullptr);
   }
 
+  size_t getSizeInBytes() const override { return SizeInBytes; }
+  
   static bool classof(const offloadtest::Buffer *B) {
     return B->getAPI() == GPUAPI::Vulkan;
   }
@@ -834,16 +836,29 @@ public:
     BufInfo.size = SizeInBytes;
     BufInfo.usage =
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    BufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
     switch (Desc.Usage) {
     case BufferUsage::Storage:
       BufInfo.usage |= VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+      break;
+    case BufferUsage::ConstantBuffer:
+      BufInfo.usage |= VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+      break;
+    case BufferUsage::IndexBuffer:
+      BufInfo.usage |=
+          VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
       break;
     case BufferUsage::VertexBuffer:
       BufInfo.usage |= VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
       break;
+    case BufferUsage::IndirectArgs:
+      BufInfo.usage |= VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                       VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+      break;
     }
-    BufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
     VkBuffer DeviceBuffer;
     if (vkCreateBuffer(Device, &BufInfo, nullptr, &DeviceBuffer))

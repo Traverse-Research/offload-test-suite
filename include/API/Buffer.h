@@ -20,15 +20,19 @@
 
 namespace offloadtest {
 
-enum class BufferUsage {
+enum class BufferUsage : uint32_t {
   Storage,
+  ConstantBuffer,
+  IndexBuffer,
   VertexBuffer,
+  IndirectArgs,
 };
 
 struct BufferCreateDesc {
   MemoryLocation Location;
   MemoryBacking Backing;
   BufferUsage Usage;
+  bool HasCounter;
 };
 
 class Buffer {
@@ -47,6 +51,8 @@ public:
   Buffer(const Buffer &) = delete;
   Buffer &operator=(const Buffer &) = delete;
 
+  virtual size_t getSizeInBytes() const = 0;
+  
   GPUAPI getAPI() const { return API; }
 
 protected:
