@@ -480,41 +480,42 @@ private:
   Capabilities Caps;
 
   // A GPU resource created for a descriptor set binding. Holds either a
-  // texture or a buffer.
+  // texture or a buffer (non-owning; owned by InvocationState).
   struct BoundResource {
-    std::variant<std::shared_ptr<DXTexture>, std::shared_ptr<DXBuffer>>
-        Resource;
+    std::variant<offloadtest::Texture *, offloadtest::Buffer *> Resource;
 
     ComPtr<ID3D12Resource> getNativeResource() const {
       return std::visit(
-          [](const auto &R) -> ComPtr<ID3D12Resource> {
+          [](const auto *R) -> ComPtr<ID3D12Resource> {
             using T = std::decay_t<decltype(*R)>;
-            if constexpr (std::is_same_v<T, DXTexture>)
-              return R->Resource;
+            if constexpr (std::is_same_v<T, offloadtest::Texture>)
+              return llvm::cast<DXTexture>(R)->Resource;
             else
-              return R->Buffer;
+              return llvm::cast<DXBuffer>(R)->Buffer;
           },
           Resource);
     }
 
     size_t getSizeInBytes() const {
-      return std::visit([](const auto &R) { return R->getSizeInBytes(); },
+      return std::visit([](const auto *R) { return R->getSizeInBytes(); },
                         Resource);
     }
   };
 
   // Pairs a source GPU resource with a CPU-readable readback buffer for
-  // copying results back after execution.
+  // copying results back after execution. Non-owning; all referenced
+  // resources are owned by InvocationState.
   struct ReadbackBinding {
-    std::shared_ptr<BoundResource> Source;
-    std::shared_ptr<DXBuffer> Destination;
+    BoundResource *Source;
+    offloadtest::Buffer *Destination;
     offloadtest::Resource *PipelineResource; // For readback data routing.
     uint32_t ArrayIndex;                     // Index within resource array.
   };
 
   // ResourceBundle will contain one BoundResource for a singular resource
-  // or multiple BoundResource for resource array.
-  using ResourceBundle = llvm::SmallVector<std::shared_ptr<BoundResource>>;
+  // or multiple BoundResource for resource array. Non-owning; the pointed-to
+  // BoundResources are owned by InvocationState::OwnedBoundResources.
+  using ResourceBundle = llvm::SmallVector<BoundResource *>;
   using ResourcePair = std::pair<offloadtest::Resource *, ResourceBundle>;
 
   struct DescriptorTable {
@@ -534,9 +535,13 @@ private:
     std::unique_ptr<offloadtest::Texture> DS;
     std::unique_ptr<offloadtest::Buffer> VB;
 
-    // Temporary resources (e.g. upload/staging buffers) that must stay alive
-    // until the GPU finishes executing the command list.
-    llvm::SmallVector<std::shared_ptr<DXBuffer>> ResourcesKeepAlive;
+    // Owning storage for GPU resources created during pipeline setup
+    // (descriptor bindings, upload/staging buffers, readback buffers).
+    // BoundResource, ReadbackBinding, and ResourceBundle hold non-owning
+    // raw pointers into these vectors.
+    llvm::SmallVector<std::unique_ptr<offloadtest::Texture>> OwnedTextures;
+    llvm::SmallVector<std::unique_ptr<offloadtest::Buffer>> OwnedBuffers;
+    llvm::SmallVector<std::unique_ptr<BoundResource>> OwnedBoundResources;
 
     // Readback bindings for copying results back to CPU after execution.
     llvm::SmallVector<ReadbackBinding> ReadbackBindings;
@@ -585,7 +590,6 @@ public:
              "Constant Buffers are not allowed to have a counter.");
       SizeInBytes = getCBVSize(SizeInBytes);
     } else if (Desc.HasCounter) {
-      const size_t A = SizeInBytes;
       SizeInBytes =
           llvm::alignTo(SizeInBytes, D3D12_UAV_COUNTER_PLACEMENT_ALIGNMENT) +
           sizeof(uint32_t);
@@ -623,7 +627,7 @@ public:
     const std::wstring WStr(Name.begin(), Name.end());
     DeviceBuffer->SetName(WStr.c_str());
 
-    return std::make_shared<DXBuffer>(DeviceBuffer, Name, Desc, SizeInBytes);
+    return std::make_unique<DXBuffer>(DeviceBuffer, Name, Desc, SizeInBytes);
   }
 
   llvm::Expected<std::unique_ptr<offloadtest::Texture>>
@@ -1020,7 +1024,7 @@ public:
     return waitForSignal(IS);
   }
 
-  llvm::Expected<std::shared_ptr<BoundResource>>
+  llvm::Expected<BoundResource *>
   createTextureGPUResource(Resource &R, const char *Name, TextureUsage Usage,
                            MemoryBacking Backing, InvocationState &IS) {
     const CPUBuffer &B = *R.BufferPtr;
@@ -1040,21 +1044,24 @@ public:
     auto TexOrErr = createTexture(Name, TexDesc);
     if (!TexOrErr)
       return TexOrErr.takeError();
-    auto Tex = std::static_pointer_cast<DXTexture>(*TexOrErr);
+    IS.OwnedTextures.emplace_back(std::move(*TexOrErr));
+    offloadtest::Texture *TexBase = IS.OwnedTextures.back().get();
 
     if (R.IsReserved) {
-      const D3D12_RESOURCE_DESC NativeDesc = Tex->Resource->GetDesc();
-      if (auto Err = setupReservedResource(R, IS, NativeDesc, Tex->ResourceHeap,
-                                           Tex->Resource))
+      auto &Tex = llvm::cast<DXTexture>(*TexBase);
+      const D3D12_RESOURCE_DESC NativeDesc = Tex.Resource->GetDesc();
+      if (auto Err = setupReservedResource(R, IS, NativeDesc, Tex.ResourceHeap,
+                                           Tex.Resource))
         return Err;
     }
 
-    auto BR = std::make_shared<BoundResource>();
-    BR->Resource = Tex;
+    IS.OwnedBoundResources.emplace_back(std::make_unique<BoundResource>());
+    BoundResource *BR = IS.OwnedBoundResources.back().get();
+    BR->Resource = TexBase;
     return BR;
   }
 
-  llvm::Expected<std::shared_ptr<BoundResource>>
+  llvm::Expected<BoundResource *>
   createBufferGPUResource(Resource &R, const char *Name, BufferUsage Usage,
                           MemoryBacking Backing, InvocationState &IS) {
     BufferCreateDesc BufDesc = {};
@@ -1065,17 +1072,20 @@ public:
     auto BufOrErr = createBuffer(Name, BufDesc, R.size());
     if (!BufOrErr)
       return BufOrErr.takeError();
-    auto Buf = std::static_pointer_cast<DXBuffer>(*BufOrErr);
+    IS.OwnedBuffers.emplace_back(std::move(*BufOrErr));
+    offloadtest::Buffer *BufBase = IS.OwnedBuffers.back().get();
 
     if (R.IsReserved) {
-      const D3D12_RESOURCE_DESC NativeDesc = Buf->Buffer->GetDesc();
-      if (auto Err = setupReservedResource(R, IS, NativeDesc, Buf->ResourceHeap,
-                                           Buf->Buffer))
+      auto &Buf = llvm::cast<DXBuffer>(*BufBase);
+      const D3D12_RESOURCE_DESC NativeDesc = Buf.Buffer->GetDesc();
+      if (auto Err = setupReservedResource(R, IS, NativeDesc, Buf.ResourceHeap,
+                                           Buf.Buffer))
         return Err;
     }
 
-    auto BR = std::make_shared<BoundResource>();
-    BR->Resource = Buf;
+    IS.OwnedBoundResources.emplace_back(std::make_unique<BoundResource>());
+    BoundResource *BR = IS.OwnedBoundResources.back().get();
+    BR->Resource = BufBase;
     return BR;
   }
 
@@ -1093,25 +1103,27 @@ public:
     auto UploadOrErr = createBuffer("Upload", UploadDesc, UploadSize);
     if (!UploadOrErr)
       return UploadOrErr.takeError();
-    auto Upload = std::static_pointer_cast<DXBuffer>(*UploadOrErr);
+    IS.OwnedBuffers.emplace_back(std::move(*UploadOrErr));
+    auto &Upload = llvm::cast<DXBuffer>(*IS.OwnedBuffers.back());
 
     void *Mapped = nullptr;
-    if (auto Err = HR::toError(Upload->Buffer->Map(0, nullptr, &Mapped),
+    if (auto Err = HR::toError(Upload.Buffer->Map(0, nullptr, &Mapped),
                                "Failed to map upload buffer."))
       return Err;
 
     if (UploadSize > DataSize)
       memset(Mapped, 0, UploadSize);
     memcpy(Mapped, Data, DataSize);
-    Upload->Buffer->Unmap(0, nullptr);
+    Upload.Buffer->Unmap(0, nullptr);
 
-    if (auto *Tex = std::get_if<std::shared_ptr<DXTexture>>(&BR.Resource)) {
-      copyBufferToTexture(IS.CB->CmdList.Get(), **Tex, *Upload);
+    if (auto *Tex = std::get_if<offloadtest::Texture *>(&BR.Resource)) {
+      copyBufferToTexture(IS.CB->CmdList.Get(), llvm::cast<DXTexture>(**Tex),
+                          Upload);
     } else {
-      auto &Buf = *std::get<std::shared_ptr<DXBuffer>>(BR.Resource);
-      copyBufferToBuffer(IS.CB->CmdList.Get(), Buf, *Upload, PutInWriteState);
+      auto &Buf = llvm::cast<DXBuffer>(
+          *std::get<offloadtest::Buffer *>(BR.Resource));
+      copyBufferToBuffer(IS.CB->CmdList.Get(), Buf, Upload, PutInWriteState);
     }
-    IS.ResourcesKeepAlive.push_back(Upload);
     return llvm::Error::success();
   }
 
@@ -1142,7 +1154,7 @@ public:
               : createBufferGPUResource(R, KindName, BufUsage, Backing, IS);
       if (!BROrErr)
         return BROrErr.takeError();
-      auto BR = *BROrErr;
+      BoundResource *BR = *BROrErr;
 
       llvm::outs() << "Creating " << KindName
                    << ": { Size = " << BR->getSizeInBytes()
@@ -1171,7 +1183,8 @@ public:
             createBuffer("Readback", ReadbackDesc, BR->getSizeInBytes());
         if (!ReadbackOrErr)
           return ReadbackOrErr.takeError();
-        auto Readback = std::static_pointer_cast<DXBuffer>(*ReadbackOrErr);
+        IS.OwnedBuffers.emplace_back(std::move(*ReadbackOrErr));
+        offloadtest::Buffer *Readback = IS.OwnedBuffers.back().get();
         IS.ReadbackBindings.push_back({BR, Readback, &R, RegOffset});
       }
 
@@ -1365,19 +1378,19 @@ public:
       const ComPtr<ID3D12Resource> Src = RB.Source->getNativeResource();
       addReadbackBeginBarrier(IS.CB->CmdList.Get(), Src);
 
+      auto &Dst = llvm::cast<DXBuffer>(*RB.Destination);
       if (auto *Tex =
-              std::get_if<std::shared_ptr<DXTexture>>(&RB.Source->Resource)) {
-        const TextureCreateDesc &Desc = (*Tex)->Desc;
+              std::get_if<offloadtest::Texture *>(&RB.Source->Resource)) {
+        const TextureCreateDesc &Desc = llvm::cast<DXTexture>(**Tex).Desc;
         const D3D12_PLACED_SUBRESOURCE_FOOTPRINT Footprint{
             0, CD3DX12_SUBRESOURCE_FOOTPRINT(
                    getDXGIFormat(Desc.Fmt), Desc.Width, Desc.Height, 1,
                    Desc.Width * getFormatSizeInBytes(Desc.Fmt))};
-        const CD3DX12_TEXTURE_COPY_LOCATION DstLoc(RB.Destination->Buffer.Get(),
-                                                   Footprint);
+        const CD3DX12_TEXTURE_COPY_LOCATION DstLoc(Dst.Buffer.Get(), Footprint);
         const CD3DX12_TEXTURE_COPY_LOCATION SrcLoc(Src.Get(), 0);
         IS.CB->CmdList->CopyTextureRegion(&DstLoc, 0, 0, 0, &SrcLoc, nullptr);
       } else {
-        IS.CB->CmdList->CopyResource(RB.Destination->Buffer.Get(), Src.Get());
+        IS.CB->CmdList->CopyResource(Dst.Buffer.Get(), Src.Get());
       }
 
       addReadbackEndBarrier(IS.CB->CmdList.Get(), Src);
@@ -1507,10 +1520,10 @@ public:
   llvm::Error readBack(Pipeline &P, InvocationState &IS) {
     for (const auto &RB : IS.ReadbackBindings) {
       const offloadtest::Resource *R = RB.PipelineResource;
+      auto &Dst = llvm::cast<DXBuffer>(*RB.Destination);
       void *DataPtr;
-      if (auto Err =
-              HR::toError(RB.Destination->Buffer->Map(0, nullptr, &DataPtr),
-                          "Failed to map result."))
+      if (auto Err = HR::toError(Dst.Buffer->Map(0, nullptr, &DataPtr),
+                                 "Failed to map result."))
         return Err;
       memcpy(R->BufferPtr->Data[RB.ArrayIndex].get(), DataPtr, R->size());
 
@@ -1521,7 +1534,7 @@ public:
                sizeof(uint32_t));
         R->BufferPtr->Counters.push_back(Counter);
       }
-      RB.Destination->Buffer->Unmap(0, nullptr);
+      Dst.Buffer->Unmap(0, nullptr);
     }
 
     // If there is no render target, return early.
@@ -1675,11 +1688,12 @@ public:
     PSODesc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
     PSODesc.DepthStencilState.StencilEnable = false;
     auto &DS = llvm::cast<DXTexture>(*IS.DS);
+    auto &RT = llvm::cast<DXTexture>(*IS.RT);
     PSODesc.DSVFormat = getDXGIFormat(DS.Desc.Fmt);
     PSODesc.SampleMask = UINT_MAX;
     PSODesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     PSODesc.NumRenderTargets = 1;
-    PSODesc.RTVFormats[0] = getDXGIFormat(IS.RT->Desc.Fmt);
+    PSODesc.RTVFormats[0] = getDXGIFormat(RT.Desc.Fmt);
     PSODesc.SampleDesc.Count = 1;
 
     if (auto Err = HR::toError(Device->CreateGraphicsPipelineState(
@@ -1721,7 +1735,7 @@ public:
         DS.ViewHandle, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
         DepthCV->Depth, DepthCV->Stencil, 0, nullptr);
 
-    const TextureCreateDesc &RTDesc = IS.RT->Desc;
+    const TextureCreateDesc &RTDesc = RT.Desc;
 
     D3D12_VIEWPORT VP = {};
     VP.Width = static_cast<float>(RTDesc.Width);
@@ -1748,7 +1762,7 @@ public:
         0, CD3DX12_SUBRESOURCE_FOOTPRINT(
                getDXGIFormat(RTDesc.Fmt), RTDesc.Width, RTDesc.Height, 1,
                RTDesc.Width * getFormatSizeInBytes(RTDesc.Fmt))};
-    const CD3DX12_TEXTURE_COPY_LOCATION DstLoc(IS.RTReadback->Buffer.Get(),
+    const CD3DX12_TEXTURE_COPY_LOCATION DstLoc(RTReadback.Buffer.Get(),
                                                Footprint);
     const CD3DX12_TEXTURE_COPY_LOCATION SrcLoc(RT.Resource.Get(), 0);
 
