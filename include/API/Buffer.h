@@ -40,7 +40,6 @@ class Buffer {
 
 public:
   virtual ~Buffer();
-  virtual size_t getSizeInBytes() const = 0;
 
   // Maps the buffer's memory for host access. Only valid for CpuToGpu and
   // GpuToCpu buffers; returns an error for GpuOnly. Each successful map() must
@@ -52,7 +51,7 @@ public:
   Buffer &operator=(const Buffer &) = delete;
 
   virtual size_t getSizeInBytes() const = 0;
-  
+
   GPUAPI getAPI() const { return API; }
 
 protected:

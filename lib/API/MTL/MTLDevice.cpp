@@ -151,8 +151,6 @@ public:
       Buf->release();
   }
 
-  size_t getSizeInBytes() const override { return SizeInBytes; }
-  
   static bool classof(const offloadtest::Buffer *B) {
     return B->getAPI() == GPUAPI::Metal;
   }
