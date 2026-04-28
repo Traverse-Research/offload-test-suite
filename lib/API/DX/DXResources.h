@@ -81,6 +81,20 @@ inline DXGI_FORMAT getDXGIFormat(Format Format) {
   llvm_unreachable("All Format cases handled");
 }
 
+inline DXGI_FORMAT getDXGIFormatForSRV(Format Format) {
+  // To access the depth component in an SRV, we need to bind it to the red
+  // component.
+  // TODO: Add support for accessing the stencil buffer.
+  switch (Format) {
+  case Format::D32Float:
+    return DXGI_FORMAT_R32_FLOAT;
+  case Format::D32FloatS8Uint:
+    return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+  default:
+    return getDXGIFormat(Format);
+  }
+}
+
 inline D3D12_RESOURCE_FLAGS getDXTextureResourceFlags(TextureUsage Usage) {
   D3D12_RESOURCE_FLAGS Flags = D3D12_RESOURCE_FLAG_NONE;
   if ((Usage & TextureUsage::Storage) != TextureUsage::None)

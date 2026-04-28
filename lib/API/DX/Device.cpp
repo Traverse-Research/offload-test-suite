@@ -327,6 +327,7 @@ public:
   // A zero ptr means no descriptor was created for that view type.
   D3D12_CPU_DESCRIPTOR_HANDLE RTVHandle = {};
   D3D12_CPU_DESCRIPTOR_HANDLE DSVHandle = {};
+  D3D12_CPU_DESCRIPTOR_HANDLE SRVHandle = {};
 
   // Physical memory backing for sparse/tiled resources.
   // Only valid for MemoryBacking::Sparse.
@@ -543,6 +544,17 @@ private:
               return llvm::cast<DXTexture>(R)->Resource;
             else
               return llvm::cast<DXBuffer>(R)->Buffer;
+          },
+          Resource);
+    }
+    D3D12_CPU_DESCRIPTOR_HANDLE getSRVHandle() const {
+      return std::visit(
+          [](const auto *R) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+            using T = std::decay_t<decltype(*R)>;
+            if constexpr (std::is_same_v<T, offloadtest::Texture>)
+              return llvm::cast<DXTexture>(R)->SRVHandle;
+            else
+              return llvm::cast<DXBuffer>(R)->SRVHandle;
           },
           Resource);
     }
@@ -813,6 +825,24 @@ public:
       Tex->DSVHandle = *HandleOrErr;
       Device->CreateDepthStencilView(DeviceTexture.Get(), nullptr,
                                      Tex->DSVHandle);
+    }
+
+    if ((Desc.Usage & TextureUsage::Sampled) != TextureUsage::None) {
+      D3D12_SHADER_RESOURCE_VIEW_DESC SRVDesc = {};
+      SRVDesc.Format = getDXGIFormatForSRV(Desc.Fmt);
+      SRVDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+      SRVDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+      SRVDesc.Texture2D.MostDetailedMip = 0;
+      SRVDesc.Texture2D.MipLevels = 1;
+      SRVDesc.Texture2D.PlaneSlice = 0;
+      SRVDesc.Texture2D.ResourceMinLODClamp = 0;
+
+      auto HandleOrErr = CSUAllocator.allocate();
+      if (!HandleOrErr)
+        return HandleOrErr.takeError();
+      Tex->SRVHandle = *HandleOrErr;
+      Device->CreateShaderResourceView(DeviceTexture.Get(), nullptr,
+                                       Tex->SRVHandle);
     }
 
     return Tex;
@@ -1325,7 +1355,6 @@ public:
                    ResourceBundle ResBundle) {
     const uint32_t EltSize = R.getElementSize();
     const uint32_t NumElts = R.size() / EltSize;
-    const D3D12_SHADER_RESOURCE_VIEW_DESC SRVDesc = getSRVDescription(R);
     const uint32_t DescHandleIncSize = Device->GetDescriptorHandleIncrementSize(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     const D3D12_CPU_DESCRIPTOR_HANDLE SRVHandleHeapStart =
@@ -1336,16 +1365,8 @@ public:
                    << " NumElts = " << NumElts << "\n";
       D3D12_CPU_DESCRIPTOR_HANDLE SRVHandle = SRVHandleHeapStart;
       SRVHandle.ptr += HeapIdx * DescHandleIncSize;
-
-      if (const auto *Buffer =
-              std::get_if<offloadtest::Buffer *>(&BR->Resource)) {
-        const DXBuffer *BufferDX = llvm::cast<DXBuffer>(*Buffer);
-        Device->CopyDescriptorsSimple(1, SRVHandle, BufferDX->SRVHandle,
-                                      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-      } else {
-        Device->CreateShaderResourceView(BR->getNativeResource().Get(),
-                                         &SRVDesc, SRVHandle);
-      }
+      Device->CopyDescriptorsSimple(1, SRVHandle, BR->getSRVHandle(),
+                                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
       HeapIdx++;
     }
     return HeapIdx;
