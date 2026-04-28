@@ -57,6 +57,10 @@ enum class Format {
   RGBA32Sint,
   RGBA32Uint,
   RGBA32Float,
+  R64Sint,
+  R64Uint,
+  RG64Sint,
+  RG64Uint,
   D32Float,
   D32FloatS8Uint,
 };
@@ -99,6 +103,14 @@ inline llvm::StringRef getFormatName(Format Format) {
     return "D32Float";
   case Format::D32FloatS8Uint:
     return "D32FloatS8Uint";
+  case Format::R64Sint:
+    return "R64Sint";
+  case Format::R64Uint:
+    return "R64Uint";
+  case Format::RG64Sint:
+    return "RG64Sint";
+  case Format::RG64Uint:
+    return "RG64Uint";
   }
   llvm_unreachable("All Format cases handled");
 }
@@ -122,12 +134,16 @@ inline uint32_t getFormatSizeInBytes(Format Format) {
   case Format::RG32Uint:
   case Format::RG32Float:
   case Format::D32FloatS8Uint:
+  case Format::R64Sint:
+  case Format::R64Uint:
     return 8;
   case Format::RGB32Float:
     return 12;
   case Format::RGBA32Sint:
   case Format::RGBA32Uint:
   case Format::RGBA32Float:
+  case Format::RG64Sint:
+  case Format::RG64Uint:
     return 16;
   }
   llvm_unreachable("All Format cases handled");
@@ -151,6 +167,10 @@ inline bool isDepthFormat(Format Format) {
   case Format::RGBA32Sint:
   case Format::RGBA32Uint:
   case Format::RGBA32Float:
+  case Format::R64Sint:
+  case Format::R64Uint:
+  case Format::RG64Sint:
+  case Format::RG64Uint:
     return false;
   case Format::D32Float:
   case Format::D32FloatS8Uint:
@@ -183,6 +203,10 @@ inline bool isTextureCompatible(Format Format) {
   case Format::RGBA32Float:
   case Format::D32Float:
   case Format::D32FloatS8Uint:
+  case Format::R64Sint:
+  case Format::R64Uint:
+  case Format::RG64Sint:
+  case Format::RG64Uint:
     return true;
   }
   llvm_unreachable("All Format cases handled");
@@ -210,6 +234,10 @@ inline bool isVertexCompatible(Format Format) {
     return true;
   case Format::D32Float:
   case Format::D32FloatS8Uint:
+  case Format::R64Sint:
+  case Format::R64Uint:
+  case Format::RG64Sint:
+  case Format::RG64Uint:
     return false;
   }
   llvm_unreachable("All Format cases handled");
@@ -239,6 +267,10 @@ inline bool isPositionCompatible(Format Format) {
   case Format::RGBA32Uint:
   case Format::D32Float:
   case Format::D32FloatS8Uint:
+  case Format::R64Sint:
+  case Format::R64Uint:
+  case Format::RG64Sint:
+  case Format::RG64Uint:
     return false;
   }
   llvm_unreachable("All Format cases handled");
