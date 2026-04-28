@@ -205,8 +205,8 @@ class MTLDevice : public offloadtest::Device {
     MTL::ComputePipelineState *ComputePipeline = nullptr;
     MTL::RenderPipelineState *RenderPipeline = nullptr;
     MTL::Buffer *ArgBuffer;
-    MTL::Buffer *VertexBuffer;
-    MTL::VertexDescriptor *VertexDescriptor;
+    MTL::Buffer *VertexBuffer = nullptr;
+    MTL::VertexDescriptor *VertexDescriptor = nullptr;
     llvm::SmallVector<MTL::Texture *> Textures;
     llvm::SmallVector<MTL::Buffer *> Buffers;
     std::unique_ptr<offloadtest::Texture> FrameBufferTexture;
@@ -447,12 +447,23 @@ class MTLDevice : public offloadtest::Device {
       IS.ArgBuffer->didModifyRange(NS::Range::Make(0, IS.ArgBuffer->length()));
     }
     if (P.isGraphics()) {
-      // Create and mark the vertex buffer as modified.
-      IS.VertexBuffer = Device->newBuffer(
-          P.Bindings.VertexBufferPtr->Data.back().get(),
-          P.Bindings.VertexBufferPtr->size(), MTL::ResourceStorageModeManaged);
-      IS.VertexBuffer->didModifyRange(
-          NS::Range::Make(0, IS.VertexBuffer->length()));
+      // VB-less draws (e.g. fullscreen quads synthesized from SV_VertexID)
+      // skip vertex-buffer creation entirely. The render pass will simply not
+      // bind a vertex buffer at slot 0.
+      if (P.Bindings.VertexBufferPtr) {
+        // Create and mark the vertex buffer as modified.
+        IS.VertexBuffer = Device->newBuffer(
+            P.Bindings.VertexBufferPtr->Data.back().get(),
+            P.Bindings.VertexBufferPtr->size(),
+            MTL::ResourceStorageModeManaged);
+        IS.VertexBuffer->didModifyRange(
+            NS::Range::Make(0, IS.VertexBuffer->length()));
+      } else if (!P.Bindings.VertexCount) {
+        return llvm::createStringError(
+            std::errc::invalid_argument,
+            "Graphics pipeline without a VertexBuffer requires an explicit "
+            "VertexCount in Bindings.");
+      }
     }
     return llvm::Error::success();
   }
@@ -634,8 +645,9 @@ class MTLDevice : public offloadtest::Device {
     CmdEncoder->setCullMode(MTL::CullModeNone);
 
     // Bind vertex buffer at slot 0 to match the vertex descriptor which
-    // references buffer index 0.
-    CmdEncoder->setVertexBuffer(IS.VertexBuffer, 0, 0);
+    // references buffer index 0. Skipped for VB-less draws.
+    if (IS.VertexBuffer)
+      CmdEncoder->setVertexBuffer(IS.VertexBuffer, 0, 0);
 
     CmdEncoder->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0),
                                P.Bindings.getVertexCount());

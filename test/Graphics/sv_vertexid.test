@@ -55,10 +55,6 @@ DescriptorSets: []
 ...
 #--- end
 
-# VB-less draws are currently wired up only in the DirectX backend. Skip on
-# the other backends until VK/MTL are refactored the same way.
-# UNSUPPORTED: Vulkan || Metal
-
 # RUN: split-file %s %t
 # RUN: %dxc_target -T vs_6_0 -Fo %t-vertex.o %t/vertex.hlsl
 # RUN: %dxc_target -T ps_6_0 -Fo %t-pixel.o %t/pixel.hlsl

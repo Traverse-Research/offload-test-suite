@@ -1276,34 +1276,42 @@ public:
       if (auto Err = createDepthStencil(P, IS))
         return Err;
 
-      if (P.Bindings.VertexBufferPtr == nullptr)
-        return llvm::createStringError(
-            std::errc::invalid_argument,
-            "No Vertex buffer specified for graphics pipeline.");
-      const Resource VertexBuffer = {ResourceKind::StructuredBuffer,
-                                     "VertexBuffer",
-                                     {},
-                                     {},
-                                     P.Bindings.VertexBufferPtr,
-                                     nullptr,
-                                     false,
-                                     std::nullopt,
-                                     false};
-      auto ExVHostBuf = createBuffer(
-          VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
-          VertexBuffer.size(), VertexBuffer.BufferPtr->Data[0].get());
-      if (!ExVHostBuf)
-        return ExVHostBuf.takeError();
-      auto ExDeviceBuf = createBuffer(
-          VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VertexBuffer.size());
-      if (!ExDeviceBuf)
-        return ExDeviceBuf.takeError();
-      VkBufferCopy Copy = {};
-      Copy.size = VertexBuffer.size();
-      vkCmdCopyBuffer(IS.CB->CmdBuffer, ExVHostBuf->Buffer, ExDeviceBuf->Buffer,
-                      1, &Copy);
-      IS.VertexBuffer = ResourceRef(*ExVHostBuf, *ExDeviceBuf);
+      // VB-less draws (e.g. fullscreen quads synthesized from SV_VertexID)
+      // skip all vertex-buffer wiring. The pipeline's vertex input state will
+      // also be configured with zero bindings further down.
+      if (P.Bindings.VertexBufferPtr == nullptr) {
+        if (!P.Bindings.VertexCount)
+          return llvm::createStringError(
+              std::errc::invalid_argument,
+              "Graphics pipeline without a VertexBuffer requires an explicit "
+              "VertexCount in Bindings.");
+      } else {
+        const Resource VertexBuffer = {ResourceKind::StructuredBuffer,
+                                       "VertexBuffer",
+                                       {},
+                                       {},
+                                       P.Bindings.VertexBufferPtr,
+                                       nullptr,
+                                       false,
+                                       std::nullopt,
+                                       false};
+        auto ExVHostBuf =
+            createBuffer(VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+                         VertexBuffer.size(), VertexBuffer.BufferPtr->Data[0].get());
+        if (!ExVHostBuf)
+          return ExVHostBuf.takeError();
+        auto ExDeviceBuf = createBuffer(
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VertexBuffer.size());
+        if (!ExDeviceBuf)
+          return ExDeviceBuf.takeError();
+        VkBufferCopy Copy = {};
+        Copy.size = VertexBuffer.size();
+        vkCmdCopyBuffer(IS.CB->CmdBuffer, ExVHostBuf->Buffer,
+                        ExDeviceBuf->Buffer, 1, &Copy);
+        IS.VertexBuffer = ResourceRef(*ExVHostBuf, *ExDeviceBuf);
+      }
     }
 
     return llvm::Error::success();
@@ -1974,11 +1982,11 @@ public:
         VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
     MultisampleStateCI.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
-    const uint32_t Stride = P.Bindings.getVertexStride();
+    const bool HasVertexBuffer = P.Bindings.VertexBufferPtr != nullptr;
 
     VkVertexInputBindingDescription VertexInputBinding{};
     VertexInputBinding.binding = 0;
-    VertexInputBinding.stride = Stride;
+    VertexInputBinding.stride = P.Bindings.getVertexStride();
     VertexInputBinding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
 
     llvm::SmallVector<VkVertexInputAttributeDescription> Attributes;
@@ -1995,8 +2003,9 @@ public:
     VkPipelineVertexInputStateCreateInfo VertexInputStateCi = {};
     VertexInputStateCi.sType =
         VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    VertexInputStateCi.vertexBindingDescriptionCount = 1;
-    VertexInputStateCi.pVertexBindingDescriptions = &VertexInputBinding;
+    VertexInputStateCi.vertexBindingDescriptionCount = HasVertexBuffer ? 1 : 0;
+    VertexInputStateCi.pVertexBindingDescriptions =
+        HasVertexBuffer ? &VertexInputBinding : nullptr;
     VertexInputStateCi.vertexAttributeDescriptionCount = Attributes.size();
     VertexInputStateCi.pVertexAttributeDescriptions = Attributes.data();
 
@@ -2368,10 +2377,11 @@ public:
       llvm::outs() << "Dispatched compute shader: { " << DispatchSize[0] << ", "
                    << DispatchSize[1] << ", " << DispatchSize[2] << " }\n";
     } else {
-      VkDeviceSize Offsets[1]{0};
-      assert(IS.VertexBuffer.has_value());
-      vkCmdBindVertexBuffers(IS.CB->CmdBuffer, 0, 1,
-                             &IS.VertexBuffer->Device.Buffer, Offsets);
+      if (IS.VertexBuffer.has_value()) {
+        VkDeviceSize Offsets[1]{0};
+        vkCmdBindVertexBuffers(IS.CB->CmdBuffer, 0, 1,
+                               &IS.VertexBuffer->Device.Buffer, Offsets);
+      }
       // instanceCount must be >=1 to draw; previously was 0 which draws nothing
       vkCmdDraw(IS.CB->CmdBuffer, P.Bindings.getVertexCount(), 1, 0, 0);
       llvm::outs() << "Drew " << P.Bindings.getVertexCount() << " vertices.\n";
