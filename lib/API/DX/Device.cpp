@@ -1687,6 +1687,7 @@ public:
             std::errc::invalid_argument,
             "Graphics pipeline without a VertexBuffer requires an explicit "
             "VertexCount in Bindings.");
+
       return llvm::Error::success();
     }
 
@@ -1933,7 +1934,9 @@ public:
       llvm::outs() << "Depth stencil created.\n";
       if (auto Err = createVertexBuffer(P, State))
         return Err;
-      llvm::outs() << "Vertex buffer created.\n";
+      llvm::outs() << (P.Bindings.VertexBufferPtr
+                           ? "Vertex buffer created.\n"
+                           : "Vertex buffer skipped (VB-less draw).\n");
       if (auto Err = createGraphicsPSO(P, State))
         return Err;
       llvm::outs() << "Graphics PSO created.\n";
