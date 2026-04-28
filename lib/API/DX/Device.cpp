@@ -1676,10 +1676,20 @@ public:
   }
 
   llvm::Error createVertexBuffer(Pipeline &P, InvocationState &IS) {
-    if (!P.Bindings.VertexBufferPtr)
-      return llvm::createStringError(
-          std::errc::invalid_argument,
-          "No vertex buffer bound for graphics pipeline.");
+    IS.CB->CmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    // VB-less draws (e.g. fullscreen quads synthesized from SV_VertexID) skip
+    // all vertex-buffer wiring. The pipeline's InputLayout is already empty
+    // because VertexAttributes is empty, and D3D12 accepts NumElements=0.
+    if (!P.Bindings.VertexBufferPtr) {
+      if (!P.Bindings.VertexCount)
+        return llvm::createStringError(
+            std::errc::invalid_argument,
+            "Graphics pipeline without a VertexBuffer requires an explicit "
+            "VertexCount in Bindings.");
+      return llvm::Error::success();
+    }
+
     const CPUBuffer &VB = *P.Bindings.VertexBufferPtr;
     const uint64_t VBSize = VB.size();
     D3D12_RESOURCE_DESC const Desc = CD3DX12_RESOURCE_DESC::Buffer(VBSize);
@@ -1704,7 +1714,6 @@ public:
     VBView.SizeInBytes = static_cast<UINT>(VBSize);
     VBView.StrideInBytes = P.Bindings.getVertexStride();
 
-    IS.CB->CmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     IS.CB->CmdList->IASetVertexBuffers(0, 1, &VBView);
 
     return llvm::Error::success();

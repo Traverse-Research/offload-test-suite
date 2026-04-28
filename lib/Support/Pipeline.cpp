@@ -402,6 +402,7 @@ void MappingTraits<offloadtest::IOBindings>::mapping(
     IO &I, offloadtest::IOBindings &B) {
   I.mapOptional("VertexBuffer", B.VertexBuffer);
   I.mapOptional("VertexAttributes", B.VertexAttributes);
+  I.mapOptional("VertexCount", B.VertexCount);
   I.mapOptional("RenderTarget", B.RenderTarget);
 }
 

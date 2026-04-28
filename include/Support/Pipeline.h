@@ -349,6 +349,10 @@ struct IOBindings {
   std::string VertexBuffer;
   CPUBuffer *VertexBufferPtr;
   llvm::SmallVector<VertexAttribute> VertexAttributes;
+  // Explicit vertex count. Required when no VertexBuffer is bound (e.g.
+  // draws that rely entirely on SV_VertexID). When both are provided, the
+  // explicit count wins.
+  std::optional<uint32_t> VertexCount;
 
   std::string RenderTarget;
   CPUBuffer *RTargetBufferPtr;
@@ -361,6 +365,8 @@ struct IOBindings {
   }
 
   uint32_t getVertexCount() const {
+    if (VertexCount)
+      return *VertexCount;
     return VertexBufferPtr->size() / getVertexStride();
   }
 };
