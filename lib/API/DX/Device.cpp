@@ -284,10 +284,13 @@ public:
   BufferCreateDesc Desc;
   size_t SizeInBytes;
 
+  D3D12_CPU_DESCRIPTOR_HANDLE SRVHandle;
+
   DXBuffer(ComPtr<ID3D12Resource> Buffer, llvm::StringRef Name,
-           BufferCreateDesc Desc, size_t SizeInBytes)
+           BufferCreateDesc Desc, size_t SizeInBytes,
+           D3D12_CPU_DESCRIPTOR_HANDLE SRVHandle)
       : offloadtest::Buffer(GPUAPI::DirectX), Buffer(Buffer), Name(Name),
-        Desc(Desc), SizeInBytes(SizeInBytes) {}
+        Desc(Desc), SizeInBytes(SizeInBytes), SRVHandle(SRVHandle) {}
 
   size_t getSizeInBytes() const override { return SizeInBytes; }
 
@@ -525,6 +528,7 @@ private:
   Capabilities Caps;
   DescriptorAllocator RTVAllocator;
   DescriptorAllocator DSVAllocator;
+  DescriptorAllocator CSUAllocator;
 
   // A GPU resource created for a descriptor set binding. Holds either a
   // texture or a buffer (non-owning; owned by InvocationState).
@@ -600,10 +604,11 @@ private:
 public:
   DXDevice(ComPtr<IDXCoreAdapter> A, ComPtr<ID3D12Device> D, DXQueue Q,
            DescriptorAllocator RTVAllocator, DescriptorAllocator DSVAllocator,
-           std::string Desc)
+           DescriptorAllocator CSUAllocator, std::string Desc)
       : Adapter(A), Device(D), GraphicsQueue(Q),
         RTVAllocator(std::move(RTVAllocator)),
-        DSVAllocator(std::move(DSVAllocator)) {
+        DSVAllocator(std::move(DSVAllocator)),
+        CSUAllocator(std::move(CSUAllocator)) {
     Description = Desc;
   }
   DXDevice(const DXDevice &) = delete;
@@ -678,7 +683,38 @@ public:
     const std::wstring WStr(Name.begin(), Name.end());
     DeviceBuffer->SetName(WStr.c_str());
 
-    return std::make_unique<DXBuffer>(DeviceBuffer, Name, Desc, SizeInBytes);
+    // Create SRV descriptor
+    auto SRVOrErr = CSUAllocator.allocate();
+    if (!SRVOrErr)
+      return SRVOrErr.takeError();
+    const D3D12_CPU_DESCRIPTOR_HANDLE SRVHandle = *SRVOrErr;
+
+    D3D12_SHADER_RESOURCE_VIEW_DESC SRVDesc = {};
+    SRVDesc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    SRVDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    switch (Desc.AccessType) {
+    case BufferShaderAccessType::Raw:
+      SRVDesc.Format = DXGI_FORMAT_R32_TYPELESS;
+      SRVDesc.Buffer.NumElements = static_cast<uint32_t>(SizeInBytes / 4);
+      SRVDesc.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+      break;
+    case BufferShaderAccessType::Typed:
+      SRVDesc.Format = getDXGIFormat(Desc.AccessTypeParams.Fmt);
+      SRVDesc.Buffer.NumElements = static_cast<uint32_t>(
+          SizeInBytes / getFormatSizeInBytes(Desc.AccessTypeParams.Fmt));
+      break;
+    case BufferShaderAccessType::Structured:
+      SRVDesc.Format = DXGI_FORMAT_UNKNOWN;
+      SRVDesc.Buffer.NumElements = static_cast<uint32_t>(
+          SizeInBytes / Desc.AccessTypeParams.StructureStride);
+      SRVDesc.Buffer.StructureByteStride =
+          Desc.AccessTypeParams.StructureStride;
+      break;
+    }
+    Device->CreateShaderResourceView(DeviceBuffer.Get(), &SRVDesc, SRVHandle);
+
+    return std::make_unique<DXBuffer>(DeviceBuffer, Name, Desc, SizeInBytes,
+                                      SRVHandle);
   }
 
   llvm::Expected<std::unique_ptr<offloadtest::Texture>>
@@ -827,9 +863,15 @@ public:
     if (!DSVHeapOrErr)
       return DSVHeapOrErr.takeError();
 
+    auto CSUHeapOrErr = DescriptorAllocator::create(
+        Device.Get(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4096);
+    if (!CSUHeapOrErr)
+      return CSUHeapOrErr.takeError();
+
     return std::make_unique<DXDevice>(
         Adapter, Device, std::move(GraphicsQueue), std::move(*RTVHeapOrErr),
-        std::move(*DSVHeapOrErr), std::string(DescVec.data()));
+        std::move(*DSVHeapOrErr), std::move(*CSUHeapOrErr),
+        std::string(DescVec.data()));
   }
 
   const Capabilities &getCapabilities() override {
@@ -1127,6 +1169,31 @@ public:
     BufDesc.Location = MemoryLocation::GpuOnly;
     BufDesc.Backing = Backing;
     BufDesc.Usage = Usage;
+    switch (R.Kind) {
+    case ResourceKind::Buffer:
+    case ResourceKind::RWBuffer: {
+      BufDesc.AccessType = BufferShaderAccessType::Typed;
+      auto FormatOrErr = toFormat(R.BufferPtr->Format, R.BufferPtr->Channels);
+      if (!FormatOrErr)
+        return FormatOrErr.takeError();
+      BufDesc.AccessTypeParams.Fmt = *FormatOrErr;
+      break;
+    }
+    case ResourceKind::StructuredBuffer:
+    case ResourceKind::RWStructuredBuffer:
+      BufDesc.AccessType = BufferShaderAccessType::Structured;
+      BufDesc.AccessTypeParams.StructureStride = R.getElementSize();
+      break;
+    case ResourceKind::ConstantBuffer:
+    case ResourceKind::ByteAddressBuffer:
+    case ResourceKind::RWByteAddressBuffer:
+      BufDesc.AccessType = BufferShaderAccessType::Raw;
+      break;
+    default:
+      printf("R.Kind was: %u\n", R.Kind);
+      llvm_unreachable("Invalid ResourceKind for a buffer.");
+      break;
+    }
     BufDesc.HasCounter = R.HasCounter;
     auto BufOrErr = createBuffer(Name, BufDesc, R.size());
     if (!BufOrErr)
@@ -1179,8 +1246,8 @@ public:
       copyBufferToTexture(IS.CB->CmdList.Get(), llvm::cast<DXTexture>(**Tex),
                           Upload);
     } else {
-      auto &Buf = llvm::cast<DXBuffer>(
-          *std::get<offloadtest::Buffer *>(BR.Resource));
+      auto &Buf =
+          llvm::cast<DXBuffer>(*std::get<offloadtest::Buffer *>(BR.Resource));
       copyBufferToBuffer(IS.CB->CmdList.Get(), Buf, Upload, PutInWriteState);
     }
     return llvm::Error::success();
@@ -1269,8 +1336,16 @@ public:
                    << " NumElts = " << NumElts << "\n";
       D3D12_CPU_DESCRIPTOR_HANDLE SRVHandle = SRVHandleHeapStart;
       SRVHandle.ptr += HeapIdx * DescHandleIncSize;
-      Device->CreateShaderResourceView(BR->getNativeResource().Get(), &SRVDesc,
-                                       SRVHandle);
+
+      if (const auto *Buffer =
+              std::get_if<offloadtest::Buffer *>(&BR->Resource)) {
+        const DXBuffer *BufferDX = llvm::cast<DXBuffer>(*Buffer);
+        Device->CopyDescriptorsSimple(1, SRVHandle, BufferDX->SRVHandle,
+                                      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+      } else {
+        Device->CreateShaderResourceView(BR->getNativeResource().Get(),
+                                         &SRVDesc, SRVHandle);
+      }
       HeapIdx++;
     }
     return HeapIdx;

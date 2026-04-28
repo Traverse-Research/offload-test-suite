@@ -20,6 +20,17 @@
 
 namespace offloadtest {
 
+enum class BufferShaderAccessType : uint32_t {
+  Raw,
+  Typed,
+  Structured,
+};
+
+union BufferShaderAccessTypeParams {
+  Format Fmt;               // Typed Only
+  uint32_t StructureStride; // Structured Only
+};
+
 enum class BufferUsage : uint32_t {
   Storage,
   ConstantBuffer,
@@ -32,6 +43,8 @@ struct BufferCreateDesc {
   MemoryLocation Location;
   MemoryBacking Backing;
   BufferUsage Usage;
+  BufferShaderAccessType AccessType;
+  BufferShaderAccessTypeParams AccessTypeParams;
   bool HasCounter;
 };
 
