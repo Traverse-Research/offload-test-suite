@@ -194,45 +194,6 @@ static DXResourceKind getDXKind(offloadtest::ResourceKind RK) {
   llvm_unreachable("All cases handled");
 }
 
-static D3D12_SHADER_RESOURCE_VIEW_DESC getSRVDescription(const Resource &R) {
-  const uint32_t EltSize = R.getElementSize();
-  const uint32_t NumElts = R.size() / EltSize;
-
-  llvm::outs() << "    EltSize = " << EltSize << " NumElts = " << NumElts
-               << "\n";
-  D3D12_SHADER_RESOURCE_VIEW_DESC Desc = {};
-  Desc.Format = R.isRaw()
-                    ? getRawDXFormat(R)
-                    : getDXFormat(R.BufferPtr->Format, R.BufferPtr->Channels);
-  Desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-  switch (R.Kind) {
-  case ResourceKind::Buffer:
-  case ResourceKind::StructuredBuffer:
-  case ResourceKind::ByteAddressBuffer:
-
-    Desc.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-    Desc.Buffer =
-        D3D12_BUFFER_SRV{0, NumElts, R.isStructuredBuffer() ? EltSize : 0,
-                         R.isByteAddressBuffer() ? D3D12_BUFFER_SRV_FLAG_RAW
-                                                 : D3D12_BUFFER_SRV_FLAG_NONE};
-    break;
-  case ResourceKind::Texture2D:
-    Desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    Desc.Texture2D = D3D12_TEX2D_SRV{0, 1, 0, 0};
-    break;
-  case ResourceKind::RWStructuredBuffer:
-  case ResourceKind::RWBuffer:
-  case ResourceKind::RWByteAddressBuffer:
-  case ResourceKind::RWTexture2D:
-  case ResourceKind::ConstantBuffer:
-  case ResourceKind::Sampler:
-    llvm_unreachable("Not an SRV type!");
-  case ResourceKind::SampledTexture2D:
-    llvm_unreachable("Sampled textures aren't supported in DirectX!");
-  }
-  return Desc;
-}
-
 static D3D12_UNORDERED_ACCESS_VIEW_DESC getUAVDescription(const Resource &R) {
   const uint32_t EltSize = R.getElementSize();
   const uint32_t NumElts = R.size() / EltSize;
