@@ -69,6 +69,14 @@ inline DXGI_FORMAT getDXGIFormat(Format Format) {
     return DXGI_FORMAT_D32_FLOAT;
   case Format::D32FloatS8Uint:
     return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+  case Format::R64Sint:
+    return DXGI_FORMAT_R32G32_SINT;
+  case Format::R64Uint:
+    return DXGI_FORMAT_R32G32_UINT;
+  case Format::RG64Sint:
+    return DXGI_FORMAT_R32G32B32A32_SINT;
+  case Format::RG64Uint:
+    return DXGI_FORMAT_R32G32B32A32_UINT;
   }
   llvm_unreachable("All Format cases handled");
 }

@@ -70,6 +70,14 @@ inline VkFormat getVulkanFormat(Format Format) {
     return VK_FORMAT_D32_SFLOAT;
   case Format::D32FloatS8Uint:
     return VK_FORMAT_D32_SFLOAT_S8_UINT;
+  case Format::R64Sint:
+    return VK_FORMAT_R64_SINT;
+  case Format::R64Uint:
+    return VK_FORMAT_R64_UINT;
+  case Format::RG64Sint:
+    return VK_FORMAT_R64G64_SINT;
+  case Format::RG64Uint:
+    return VK_FORMAT_R64G64_UINT;
   }
   llvm_unreachable("All Format cases handled");
 }
