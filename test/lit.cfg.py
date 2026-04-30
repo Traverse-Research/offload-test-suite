@@ -151,11 +151,16 @@ def setDeviceFeatures(config, device, compiler):
         if device["Features"].get("AtomicInt64OnGroupSharedSupported", False):
             config.available_features.add("Int64GroupSharedAtomics")
         setWaveSizeFeaturesDirectX(config, device)
+        rt_tier = device["Features"].get("RaytracingTier", "NotSupported")
+        if rt_tier and rt_tier != "NotSupported":
+            config.available_features.add("acceleration-structure")
 
     if device["API"] == "Metal":
         config.available_features.add("Int16")
         config.available_features.add("Int64")
         config.available_features.add("Half")
+        if device["Features"].get("supportsRaytracing", False):
+            config.available_features.add("acceleration-structure")
 
     if device["API"] == "Vulkan":
         if device["Features"].get("shaderInt16", False):
@@ -172,6 +177,9 @@ def setDeviceFeatures(config, device, compiler):
         # Add supported extensions.
         for Extension in device["Extensions"]:
             config.available_features.add(Extension["ExtensionName"])
+
+        if "VK_KHR_acceleration_structure" in config.available_features:
+            config.available_features.add("acceleration-structure")
 
 
 offloader_args = []

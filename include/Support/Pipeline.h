@@ -13,6 +13,7 @@
 #ifndef OFFLOADTEST_SUPPORT_PIPELINE_H
 #define OFFLOADTEST_SUPPORT_PIPELINE_H
 
+#include "API/AccelerationStructure.h"
 #include "API/Enums.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
@@ -81,6 +82,8 @@ static inline DescriptorKind getDescriptorKind(ResourceKind RK) {
     return DescriptorKind::SAMPLER;
   case ResourceKind::SampledTexture2D:
     llvm_unreachable("Sampled textures aren't supported!");
+  case ResourceKind::AccelerationStructure:
+    return DescriptorKind::SRV;
   }
   llvm_unreachable("All cases handled");
 }
@@ -207,6 +210,8 @@ struct Result {
   double Epsilon;
 };
 
+struct CPUTLASDesc;
+
 struct Resource {
   ResourceKind Kind;
   std::string Name;
@@ -217,6 +222,11 @@ struct Resource {
   bool HasCounter;
   std::optional<uint32_t> TilesMapped;
   bool IsReserved = false;
+  CPUTLASDesc *TLASPtr = nullptr;
+
+  bool isAccelerationStructure() const {
+    return Kind == ResourceKind::AccelerationStructure;
+  }
 
   bool isRaw() const {
     switch (Kind) {
@@ -226,6 +236,7 @@ struct Resource {
     case ResourceKind::RWTexture2D:
     case ResourceKind::Sampler:
     case ResourceKind::SampledTexture2D:
+    case ResourceKind::AccelerationStructure:
       return false;
     case ResourceKind::StructuredBuffer:
     case ResourceKind::RWStructuredBuffer:
@@ -251,6 +262,7 @@ struct Resource {
     case ResourceKind::Texture2D:
     case ResourceKind::RWTexture2D:
     case ResourceKind::SampledTexture2D:
+    case ResourceKind::AccelerationStructure:
       return false;
     }
     llvm_unreachable("All cases handled");
@@ -266,6 +278,7 @@ struct Resource {
     case ResourceKind::RWByteAddressBuffer:
     case ResourceKind::ConstantBuffer:
     case ResourceKind::Sampler:
+    case ResourceKind::AccelerationStructure:
       return false;
     case ResourceKind::Texture2D:
     case ResourceKind::RWTexture2D:
@@ -305,18 +318,22 @@ struct Resource {
   }
 
   uint32_t getElementSize() const {
-    assert(!isSampler() && "Samplers do not have element size");
+    assert(!isSampler() && !isAccelerationStructure() &&
+           "Samplers and AS do not have element size");
     // ByteAddressBuffers are treated as 4-byte elements to match their memory
     // format.
     return isByteAddressBuffer() ? 4 : BufferPtr->getElementSize();
   }
 
   uint32_t getArraySize() const {
-    return isSampler() ? 1 : BufferPtr->ArraySize;
+    if (isSampler() || isAccelerationStructure())
+      return 1;
+    return BufferPtr->ArraySize;
   }
 
   uint32_t size() const {
-    assert(!isSampler() && "Samplers do not have size");
+    assert(!isSampler() && !isAccelerationStructure() &&
+           "Samplers and AS do not have size");
     return BufferPtr->size();
   }
 
@@ -329,6 +346,7 @@ struct Resource {
     case ResourceKind::ConstantBuffer:
     case ResourceKind::Sampler:
     case ResourceKind::SampledTexture2D:
+    case ResourceKind::AccelerationStructure:
       return false;
     case ResourceKind::RWBuffer:
     case ResourceKind::RWStructuredBuffer:
@@ -444,6 +462,51 @@ struct DispatchParametersSet {
   std::optional<uint32_t> VertexCount;
 };
 
+struct CPUTriangleGeometry {
+  std::string VertexBuffer;
+  CPUBuffer *VertexBufferPtr = nullptr;
+  Format VertexFormat = Format::RGB32Float;
+  uint32_t VertexStride = 12;
+  uint32_t VertexCount = 0;
+  std::string IndexBuffer;
+  CPUBuffer *IndexBufferPtr = nullptr;
+  IndexFormat IdxFormat = IndexFormat::Uint32;
+  uint32_t IndexCount = 0;
+  bool Opaque = true;
+};
+
+struct CPUAABBGeometry {
+  std::string AABBBuffer;
+  CPUBuffer *AABBBufferPtr = nullptr;
+  uint32_t AABBCount = 0;
+  uint32_t AABBStride = 24;
+  bool Opaque = true;
+};
+
+struct CPUBLASDesc {
+  std::string Name;
+  llvm::SmallVector<CPUTriangleGeometry> Triangles;
+  llvm::SmallVector<CPUAABBGeometry> AABBs;
+};
+
+struct CPUInstanceDesc {
+  std::string BLAS;
+  int BLASIdx = -1;
+  float Transform[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+  uint32_t InstanceID = 0;
+  uint8_t InstanceMask = 0xFF;
+};
+
+struct CPUTLASDesc {
+  std::string Name;
+  llvm::SmallVector<CPUInstanceDesc> Instances;
+};
+
+struct AccelerationStructureDescs {
+  llvm::SmallVector<CPUBLASDesc> BLAS;
+  llvm::SmallVector<CPUTLASDesc> TLAS;
+};
+
 struct Pipeline {
   ShaderPipelineKind Kind;
   llvm::SmallVector<Shader> Shaders;
@@ -456,6 +519,7 @@ struct Pipeline {
   llvm::SmallVector<Result> Results;
   llvm::SmallVector<DescriptorSet> Sets;
   DispatchParametersSet DispatchParameters;
+  AccelerationStructureDescs AccelStructs;
 
   uint32_t getVertexCount() const {
     if (DispatchParameters.VertexCount)
@@ -496,6 +560,20 @@ struct Pipeline {
     return nullptr;
   }
 
+  CPUBLASDesc *getBLAS(llvm::StringRef Name) {
+    for (auto &B : AccelStructs.BLAS)
+      if (Name == B.Name)
+        return &B;
+    return nullptr;
+  }
+
+  CPUTLASDesc *getTLAS(llvm::StringRef Name) {
+    for (auto &T : AccelStructs.TLAS)
+      if (Name == T.Name)
+        return &T;
+    return nullptr;
+  }
+
   llvm::Error validatePipelineKind();
   llvm::Error validateDispatchParameters();
 
@@ -518,6 +596,11 @@ LLVM_YAML_IS_SEQUENCE_VECTOR(offloadtest::SpecializationConstant)
 LLVM_YAML_IS_SEQUENCE_VECTOR(offloadtest::PushConstantBlock)
 LLVM_YAML_IS_SEQUENCE_VECTOR(offloadtest::PushConstantValue)
 LLVM_YAML_IS_SEQUENCE_VECTOR(offloadtest::DispatchParametersSet)
+LLVM_YAML_IS_SEQUENCE_VECTOR(offloadtest::CPUTriangleGeometry)
+LLVM_YAML_IS_SEQUENCE_VECTOR(offloadtest::CPUAABBGeometry)
+LLVM_YAML_IS_SEQUENCE_VECTOR(offloadtest::CPUBLASDesc)
+LLVM_YAML_IS_SEQUENCE_VECTOR(offloadtest::CPUInstanceDesc)
+LLVM_YAML_IS_SEQUENCE_VECTOR(offloadtest::CPUTLASDesc)
 
 namespace llvm {
 namespace yaml {
@@ -600,6 +683,30 @@ template <> struct MappingTraits<offloadtest::RuntimeSettings> {
 
 template <> struct MappingTraits<offloadtest::SpecializationConstant> {
   static void mapping(IO &I, offloadtest::SpecializationConstant &C);
+};
+
+template <> struct MappingTraits<offloadtest::CPUTriangleGeometry> {
+  static void mapping(IO &I, offloadtest::CPUTriangleGeometry &G);
+};
+
+template <> struct MappingTraits<offloadtest::CPUAABBGeometry> {
+  static void mapping(IO &I, offloadtest::CPUAABBGeometry &G);
+};
+
+template <> struct MappingTraits<offloadtest::CPUBLASDesc> {
+  static void mapping(IO &I, offloadtest::CPUBLASDesc &D);
+};
+
+template <> struct MappingTraits<offloadtest::CPUInstanceDesc> {
+  static void mapping(IO &I, offloadtest::CPUInstanceDesc &D);
+};
+
+template <> struct MappingTraits<offloadtest::CPUTLASDesc> {
+  static void mapping(IO &I, offloadtest::CPUTLASDesc &D);
+};
+
+template <> struct MappingTraits<offloadtest::AccelerationStructureDescs> {
+  static void mapping(IO &I, offloadtest::AccelerationStructureDescs &D);
 };
 
 template <> struct ScalarEnumerationTraits<offloadtest::Rule> {
@@ -703,6 +810,41 @@ template <> struct ScalarEnumerationTraits<offloadtest::ResourceKind> {
     ENUM_CASE(ConstantBuffer);
     ENUM_CASE(Sampler);
     ENUM_CASE(SampledTexture2D);
+    ENUM_CASE(AccelerationStructure);
+#undef ENUM_CASE
+  }
+};
+
+template <> struct ScalarEnumerationTraits<offloadtest::Format> {
+  static void enumeration(IO &I, offloadtest::Format &V) {
+#define ENUM_CASE(Val) I.enumCase(V, #Val, offloadtest::Format::Val)
+    ENUM_CASE(R16Sint);
+    ENUM_CASE(R16Uint);
+    ENUM_CASE(RG16Sint);
+    ENUM_CASE(RG16Uint);
+    ENUM_CASE(RGBA16Sint);
+    ENUM_CASE(RGBA16Uint);
+    ENUM_CASE(R32Sint);
+    ENUM_CASE(R32Uint);
+    ENUM_CASE(R32Float);
+    ENUM_CASE(RG32Sint);
+    ENUM_CASE(RG32Uint);
+    ENUM_CASE(RG32Float);
+    ENUM_CASE(RGB32Float);
+    ENUM_CASE(RGBA32Sint);
+    ENUM_CASE(RGBA32Uint);
+    ENUM_CASE(RGBA32Float);
+    ENUM_CASE(D32Float);
+    ENUM_CASE(D32FloatS8Uint);
+#undef ENUM_CASE
+  }
+};
+
+template <> struct ScalarEnumerationTraits<offloadtest::IndexFormat> {
+  static void enumeration(IO &I, offloadtest::IndexFormat &V) {
+#define ENUM_CASE(Val) I.enumCase(V, #Val, offloadtest::IndexFormat::Val)
+    ENUM_CASE(Uint16);
+    ENUM_CASE(Uint32);
 #undef ENUM_CASE
   }
 };

@@ -785,6 +785,8 @@ class MTLDevice : public offloadtest::Device {
       case ResourceKind::RWByteAddressBuffer:
       case ResourceKind::ConstantBuffer:
         llvm_unreachable("Raw is checked above");
+      case ResourceKind::AccelerationStructure:
+        llvm_unreachable("Acceleration structures use a separate path!");
       }
 
       MTL::Texture *NewTex = Device->newTexture(Desc);
@@ -1717,7 +1719,12 @@ public:
   virtual ~MTLDevice() {};
 
 private:
-  void queryCapabilities() {}
+  void queryCapabilities() {
+    Caps.insert(std::make_pair(
+        "supportsRaytracing",
+        makeCapability<bool>("supportsRaytracing",
+                             Device->supportsRaytracing())));
+  }
 };
 } // namespace
 

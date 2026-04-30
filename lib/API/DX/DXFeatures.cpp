@@ -52,3 +52,17 @@ std::string CapabilityPrinter<directx::RootSignature>::toString(
     const directx::RootSignature &V) {
   return enumEntryToString(getRootSignatures(), V);
 }
+
+#define RAYTRACING_TIER_ENUM(NewCase, Str, Value) {#Str, NewCase},
+static const EnumEntry<directx::RaytracingTier> RaytracingTierNames[]{
+#include "DXFeatures.def"
+};
+
+static ArrayRef<EnumEntry<RaytracingTier>> getRaytracingTiers() {
+  return ArrayRef(RaytracingTierNames);
+}
+
+std::string CapabilityPrinter<directx::RaytracingTier>::toString(
+    const directx::RaytracingTier &V) {
+  return enumEntryToString(getRaytracingTiers(), V);
+}
