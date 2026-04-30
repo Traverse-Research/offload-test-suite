@@ -88,6 +88,28 @@ inline VkImageUsageFlags getVulkanImageUsage(TextureUsage Usage) {
   return Flags;
 }
 
+inline VkIndexType getVulkanIndexType(IndexFormat Fmt) {
+  switch (Fmt) {
+  case IndexFormat::Uint16:
+    return VK_INDEX_TYPE_UINT16;
+  case IndexFormat::Uint32:
+    return VK_INDEX_TYPE_UINT32;
+  }
+  llvm_unreachable("All IndexFormat cases handled");
+}
+
+inline VkBuildAccelerationStructureFlagsKHR
+getVulkanASBuildFlags(AccelerationStructureBuildFlags Flags) {
+  VkBuildAccelerationStructureFlagsKHR Result = 0;
+  if (Flags & AllowUpdate)
+    Result |= VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
+  if (Flags & PreferFastTrace)
+    Result |= VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+  if (Flags & PreferFastBuild)
+    Result |= VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR;
+  return Result;
+}
+
 } // namespace offloadtest
 
 #endif // OFFLOADTEST_API_VKRESOURCES_H

@@ -411,6 +411,23 @@ public:
   }
 };
 
+class DXAccelerationStructure : public offloadtest::AccelerationStructure {
+public:
+  ComPtr<ID3D12Resource> Resource;
+
+  DXAccelerationStructure(ComPtr<ID3D12Resource> Resource)
+      : offloadtest::AccelerationStructure(GPUAPI::DirectX),
+        Resource(Resource) {}
+
+  D3D12_GPU_VIRTUAL_ADDRESS getGPUVirtualAddress() const {
+    return Resource->GetGPUVirtualAddress();
+  }
+
+  static bool classof(const offloadtest::AccelerationStructure *AS) {
+    return AS->getAPI() == GPUAPI::DirectX;
+  }
+};
+
 class DXFence : public offloadtest::Fence {
 public:
 #ifdef _WIN32
@@ -685,6 +702,7 @@ class DXDevice : public offloadtest::Device {
 private:
   ComPtr<IDXCoreAdapter> Adapter;
   ComPtr<ID3D12Device> Device;
+  ComPtr<ID3D12Device5> Device5;
   DXQueue GraphicsQueue;
   Capabilities Caps;
   DescriptorAllocator RTVAllocator;
@@ -733,6 +751,8 @@ public:
         RTVAllocator(std::move(RTVAllocator)),
         DSVAllocator(std::move(DSVAllocator)) {
     Description = Desc;
+    // Query for ID3D12Device5 (ray tracing support). Null = not supported.
+    Device->QueryInterface(IID_PPV_ARGS(&Device5));
   }
   DXDevice(const DXDevice &) = delete;
   DXDevice &operator=(const DXDevice &) = delete;
@@ -1180,6 +1200,179 @@ public:
   llvm::Expected<std::unique_ptr<offloadtest::CommandBuffer>>
   createCommandBuffer() override {
     return DXCommandBuffer::create(Device);
+  }
+
+  llvm::Expected<BLASBuildRequest>
+  createBLASBuildRequest(llvm::ArrayRef<TriangleGeometryDesc> Triangles,
+                         llvm::ArrayRef<AABBGeometryDesc> AABBs,
+                         AccelerationStructureBuildFlags Flags) override {
+    if (!Device5)
+      return llvm::createStringError(
+          std::errc::not_supported,
+          "Ray tracing is not supported on this device.");
+
+    BLASBuildRequest Req;
+    Req.Triangles.assign(Triangles.begin(), Triangles.end());
+    Req.AABBs.assign(AABBs.begin(), AABBs.end());
+    Req.Flags = Flags;
+
+    if (auto Err = validateBLASBuildRequest(Req))
+      return Err;
+
+    llvm::SmallVector<D3D12_RAYTRACING_GEOMETRY_DESC> GeomDescs;
+    GeomDescs.reserve(Triangles.size() + AABBs.size());
+
+    for (const auto &T : Triangles) {
+      D3D12_RAYTRACING_GEOMETRY_DESC GD = {};
+      GD.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES;
+      if (T.Opaque)
+        GD.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+
+      auto &Tri = GD.Triangles;
+      // GPU addresses are not needed for the prebuild size query; they will
+      // be populated at build time.
+      Tri.VertexBuffer.StrideInBytes = T.VertexStride;
+      Tri.VertexCount = T.VertexCount;
+      Tri.VertexFormat = getDXGIFormat(T.VertexFormat);
+
+      if (T.IndexBuffer) {
+        Tri.IndexCount = T.IndexCount;
+        Tri.IndexFormat = getDXGIIndexFormat(T.IdxFormat);
+      }
+
+      GeomDescs.push_back(GD);
+    }
+
+    for (const auto &A : AABBs) {
+      D3D12_RAYTRACING_GEOMETRY_DESC GD = {};
+      GD.Type = D3D12_RAYTRACING_GEOMETRY_TYPE_PROCEDURAL_PRIMITIVE_AABBS;
+      if (A.Opaque)
+        GD.Flags = D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE;
+
+      GD.AABBs.AABBs.StrideInBytes = A.AABBStride;
+      GD.AABBs.AABBCount = A.AABBCount;
+
+      GeomDescs.push_back(GD);
+    }
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS Inputs = {};
+    Inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL;
+    Inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    Inputs.NumDescs = GeomDescs.size();
+    Inputs.pGeometryDescs = GeomDescs.data();
+
+    if (Flags & AllowUpdate)
+      Inputs.Flags |=
+          D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE;
+    if (Flags & PreferFastTrace)
+      Inputs.Flags |=
+          D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+    if (Flags & PreferFastBuild)
+      Inputs.Flags |=
+          D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD;
+
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO Info = {};
+    Device5->GetRaytracingAccelerationStructurePrebuildInfo(&Inputs, &Info);
+
+    Req.Sizes.ResultDataMaxSizeInBytes = Info.ResultDataMaxSizeInBytes;
+    Req.Sizes.ScratchDataSizeInBytes = Info.ScratchDataSizeInBytes;
+    Req.Sizes.UpdateScratchDataSizeInBytes = Info.UpdateScratchDataSizeInBytes;
+
+    return Req;
+  }
+
+  llvm::Expected<TLASBuildRequest> createTLASBuildRequest(
+      llvm::ArrayRef<AccelerationStructureInstance> Instances,
+      AccelerationStructureBuildFlags Flags) override {
+    if (!Device5)
+      return llvm::createStringError(
+          std::errc::not_supported,
+          "Ray tracing is not supported on this device.");
+
+    TLASBuildRequest Req;
+    Req.Instances.assign(Instances.begin(), Instances.end());
+    Req.Flags = Flags;
+
+    if (auto Err = validateTLASBuildRequest(Req))
+      return Err;
+
+    D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS Inputs = {};
+    Inputs.Type = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;
+    Inputs.DescsLayout = D3D12_ELEMENTS_LAYOUT_ARRAY;
+    Inputs.NumDescs = Instances.size();
+
+    if (Flags & AllowUpdate)
+      Inputs.Flags |=
+          D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE;
+    if (Flags & PreferFastTrace)
+      Inputs.Flags |=
+          D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
+    if (Flags & PreferFastBuild)
+      Inputs.Flags |=
+          D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_BUILD;
+
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO Info = {};
+    Device5->GetRaytracingAccelerationStructurePrebuildInfo(&Inputs, &Info);
+
+    Req.Sizes.ResultDataMaxSizeInBytes = Info.ResultDataMaxSizeInBytes;
+    Req.Sizes.ScratchDataSizeInBytes = Info.ScratchDataSizeInBytes;
+    Req.Sizes.UpdateScratchDataSizeInBytes = Info.UpdateScratchDataSizeInBytes;
+
+    return Req;
+  }
+
+  llvm::Expected<std::unique_ptr<offloadtest::AccelerationStructure>>
+  createAccelerationStructure(const BLASBuildRequest &Request) override {
+    if (!Device5)
+      return llvm::createStringError(
+          std::errc::not_supported,
+          "Ray tracing is not supported on this device.");
+
+    const uint64_t AlignedSize =
+        llvm::alignTo(Request.Sizes.ResultDataMaxSizeInBytes,
+                      D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
+    const D3D12_HEAP_PROPERTIES HeapProps =
+        CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+    const D3D12_RESOURCE_DESC BufferDesc = CD3DX12_RESOURCE_DESC::Buffer(
+        AlignedSize, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+
+    ComPtr<ID3D12Resource> ASBuffer;
+    if (auto Err = HR::toError(
+            Device->CreateCommittedResource(
+                &HeapProps, D3D12_HEAP_FLAG_NONE, &BufferDesc,
+                D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, nullptr,
+                IID_PPV_ARGS(&ASBuffer)),
+            "Failed to create BLAS resource."))
+      return Err;
+
+    return std::make_unique<DXAccelerationStructure>(ASBuffer);
+  }
+
+  llvm::Expected<std::unique_ptr<offloadtest::AccelerationStructure>>
+  createAccelerationStructure(const TLASBuildRequest &Request) override {
+    if (!Device5)
+      return llvm::createStringError(
+          std::errc::not_supported,
+          "Ray tracing is not supported on this device.");
+
+    const uint64_t AlignedSize =
+        llvm::alignTo(Request.Sizes.ResultDataMaxSizeInBytes,
+                      D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BYTE_ALIGNMENT);
+    const D3D12_HEAP_PROPERTIES HeapProps =
+        CD3DX12_HEAP_PROPERTIES(D3D12_HEAP_TYPE_DEFAULT);
+    const D3D12_RESOURCE_DESC BufferDesc = CD3DX12_RESOURCE_DESC::Buffer(
+        AlignedSize, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+
+    ComPtr<ID3D12Resource> ASBuffer;
+    if (auto Err = HR::toError(
+            Device->CreateCommittedResource(
+                &HeapProps, D3D12_HEAP_FLAG_NONE, &BufferDesc,
+                D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE, nullptr,
+                IID_PPV_ARGS(&ASBuffer)),
+            "Failed to create TLAS resource."))
+      return Err;
+
+    return std::make_unique<DXAccelerationStructure>(ASBuffer);
   }
 
   void addResourceUploadCommands(Resource &R, InvocationState &IS,

@@ -34,6 +34,8 @@ Queue::~Queue() {}
 
 Texture::~Texture() {}
 
+AccelerationStructure::~AccelerationStructure() {}
+
 Device::~Device() {}
 
 llvm::Expected<llvm::SmallVector<std::unique_ptr<Device>>>

@@ -15,6 +15,7 @@
 #include "Config.h"
 
 #include "API/API.h"
+#include "API/AccelerationStructure.h"
 #include "API/Buffer.h"
 #include "API/Capabilities.h"
 #include "API/CommandBuffer.h"
@@ -179,6 +180,21 @@ public:
 
   virtual llvm::Expected<std::unique_ptr<CommandBuffer>>
   createCommandBuffer() = 0;
+
+  virtual llvm::Expected<BLASBuildRequest> createBLASBuildRequest(
+      llvm::ArrayRef<TriangleGeometryDesc> Triangles,
+      llvm::ArrayRef<AABBGeometryDesc> AABBs,
+      AccelerationStructureBuildFlags Flags = BuildFlagNone) = 0;
+
+  virtual llvm::Expected<TLASBuildRequest> createTLASBuildRequest(
+      llvm::ArrayRef<AccelerationStructureInstance> Instances,
+      AccelerationStructureBuildFlags Flags = BuildFlagNone) = 0;
+
+  virtual llvm::Expected<std::unique_ptr<AccelerationStructure>>
+  createAccelerationStructure(const BLASBuildRequest &Request) = 0;
+
+  virtual llvm::Expected<std::unique_ptr<AccelerationStructure>>
+  createAccelerationStructure(const TLASBuildRequest &Request) = 0;
 
   virtual ~Device() = 0;
 
