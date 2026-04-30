@@ -49,11 +49,16 @@ void MappingTraits<offloadtest::Pipeline>::mapping(IO &I,
   I.mapRequired("DescriptorSets", P.Sets);
   I.mapOptional("Bindings", P.Bindings);
   I.mapOptional("PushConstants", P.PushConstants);
+  I.mapOptional("AccelerationStructures", P.AccelStructs);
 
   if (!I.outputting()) {
     for (auto &D : P.Sets) {
       for (auto &R : D.Resources) {
-        if (R.isSampledTexture()) {
+        if (R.isAccelerationStructure()) {
+          R.TLASPtr = P.getTLAS(R.Name);
+          if (!R.TLASPtr)
+            I.setError(Twine("Referenced TLAS ") + R.Name + " not found!");
+        } else if (R.isSampledTexture()) {
           R.SamplerPtr = P.getSampler(R.Name);
           if (!R.SamplerPtr)
             I.setError(Twine("Referenced sampler ") + R.Name + " not found!");
@@ -132,6 +137,45 @@ void MappingTraits<offloadtest::Pipeline>::mapping(IO &I,
       if (!P.Bindings.RTargetBufferPtr)
         I.setError(Twine("Referenced render target buffer ") +
                    P.Bindings.RenderTarget + " not found!");
+    }
+
+    // Resolve buffer name references in acceleration structure descriptions.
+    for (auto &B : P.AccelStructs.BLAS) {
+      for (auto &T : B.Triangles) {
+        T.VertexBufferPtr = P.getBuffer(T.VertexBuffer);
+        if (!T.VertexBufferPtr)
+          I.setError(Twine("BLAS '") + B.Name +
+                     "': referenced vertex buffer '" + T.VertexBuffer +
+                     "' not found!");
+        if (!T.IndexBuffer.empty()) {
+          T.IndexBufferPtr = P.getBuffer(T.IndexBuffer);
+          if (!T.IndexBufferPtr)
+            I.setError(Twine("BLAS '") + B.Name +
+                       "': referenced index buffer '" + T.IndexBuffer +
+                       "' not found!");
+        }
+      }
+      for (auto &A : B.AABBs) {
+        A.AABBBufferPtr = P.getBuffer(A.AABBBuffer);
+        if (!A.AABBBufferPtr)
+          I.setError(Twine("BLAS '") + B.Name + "': referenced AABB buffer '" +
+                     A.AABBBuffer + "' not found!");
+      }
+    }
+
+    // Resolve BLAS name references in TLAS instance descriptions.
+    for (auto &T : P.AccelStructs.TLAS) {
+      for (auto &Inst : T.Instances) {
+        for (int Idx = 0, E = P.AccelStructs.BLAS.size(); Idx < E; ++Idx) {
+          if (P.AccelStructs.BLAS[Idx].Name == Inst.BLAS) {
+            Inst.BLASIdx = Idx;
+            break;
+          }
+        }
+        if (Inst.BLASIdx < 0)
+          I.setError(Twine("TLAS '") + T.Name + "': referenced BLAS '" +
+                     Inst.BLAS + "' not found!");
+      }
     }
   }
 }
@@ -550,6 +594,56 @@ void MappingTraits<offloadtest::SpecializationConstant>::mapping(
   I.mapRequired("ConstantID", C.ConstantID);
   I.mapRequired("Type", C.Type);
   I.mapRequired("Value", C.Value);
+}
+
+void MappingTraits<offloadtest::CPUTriangleGeometry>::mapping(
+    IO &I, offloadtest::CPUTriangleGeometry &G) {
+  I.mapRequired("VertexBuffer", G.VertexBuffer);
+  I.mapOptional("VertexFormat", G.VertexFormat, Format::RGB32Float);
+  I.mapOptional("VertexStride", G.VertexStride, 12u);
+  I.mapRequired("VertexCount", G.VertexCount);
+  I.mapOptional("IndexBuffer", G.IndexBuffer, std::string());
+  I.mapOptional("IndexFormat", G.IdxFormat, IndexFormat::Uint32);
+  I.mapOptional("IndexCount", G.IndexCount, 0u);
+  I.mapOptional("Opaque", G.Opaque, true);
+}
+
+void MappingTraits<offloadtest::CPUAABBGeometry>::mapping(
+    IO &I, offloadtest::CPUAABBGeometry &G) {
+  I.mapRequired("AABBBuffer", G.AABBBuffer);
+  I.mapRequired("AABBCount", G.AABBCount);
+  I.mapOptional("AABBStride", G.AABBStride, 24u);
+  I.mapOptional("Opaque", G.Opaque, true);
+}
+
+void MappingTraits<offloadtest::CPUBLASDesc>::mapping(
+    IO &I, offloadtest::CPUBLASDesc &D) {
+  I.mapRequired("Name", D.Name);
+  I.mapOptional("Triangles", D.Triangles);
+  I.mapOptional("AABBs", D.AABBs);
+}
+
+void MappingTraits<offloadtest::CPUInstanceDesc>::mapping(
+    IO &I, offloadtest::CPUInstanceDesc &D) {
+  I.mapRequired("BLAS", D.BLAS);
+  llvm::MutableArrayRef<float> TransformRef(D.Transform);
+  I.mapOptional("Transform", TransformRef);
+  I.mapOptional("InstanceID", D.InstanceID, 0u);
+  uint32_t Mask = D.InstanceMask;
+  I.mapOptional("InstanceMask", Mask, 255u);
+  D.InstanceMask = static_cast<uint8_t>(Mask);
+}
+
+void MappingTraits<offloadtest::CPUTLASDesc>::mapping(
+    IO &I, offloadtest::CPUTLASDesc &D) {
+  I.mapRequired("Name", D.Name);
+  I.mapRequired("Instances", D.Instances);
+}
+
+void MappingTraits<offloadtest::AccelerationStructureDescs>::mapping(
+    IO &I, offloadtest::AccelerationStructureDescs &D) {
+  I.mapOptional("BLAS", D.BLAS);
+  I.mapOptional("TLAS", D.TLAS);
 }
 
 } // namespace yaml

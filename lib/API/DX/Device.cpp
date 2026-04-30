@@ -189,6 +189,8 @@ static D3D12_RESOURCE_DIMENSION getDXDimension(ResourceKind RK) {
     return D3D12_RESOURCE_DIMENSION_UNKNOWN;
   case ResourceKind::SampledTexture2D:
     llvm_unreachable("SampledTextures aren't supported in DirectX!");
+  case ResourceKind::AccelerationStructure:
+    return D3D12_RESOURCE_DIMENSION_BUFFER;
   }
   llvm_unreachable("All cases handled");
 }
@@ -216,6 +218,8 @@ static DXResourceKind getDXKind(offloadtest::ResourceKind RK) {
     return SAMPLER;
   case ResourceKind::SampledTexture2D:
     llvm_unreachable("Sampled textures aren't supported in DirectX!");
+  case ResourceKind::AccelerationStructure:
+    return SRV;
   }
   llvm_unreachable("All cases handled");
 }
@@ -288,6 +292,8 @@ static D3D12_SHADER_RESOURCE_VIEW_DESC getSRVDescription(const Resource &R) {
     llvm_unreachable("Not an SRV type!");
   case ResourceKind::SampledTexture2D:
     llvm_unreachable("Sampled textures aren't supported in DirectX!");
+  case ResourceKind::AccelerationStructure:
+    llvm_unreachable("Acceleration structures use a separate descriptor path!");
   }
   return Desc;
 }
@@ -327,6 +333,8 @@ static D3D12_UNORDERED_ACCESS_VIEW_DESC getUAVDescription(const Resource &R) {
     llvm_unreachable("Not a UAV type!");
   case ResourceKind::SampledTexture2D:
     llvm_unreachable("Sampled textures aren't supported in DirectX!");
+  case ResourceKind::AccelerationStructure:
+    llvm_unreachable("Acceleration structures use a separate descriptor path!");
   }
   return Desc;
 }
