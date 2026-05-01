@@ -707,6 +707,20 @@ public:
     return llvm::Error::success();
   }
 
+  llvm::Error dispatchIndirect(offloadtest::Buffer &ArgBuffer,
+                               size_t Offset) override {
+    addDstBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                      VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                  VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT |
+                      VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
+    auto &VKBuf = static_cast<VulkanBuffer &>(ArgBuffer);
+    insertDebugSignpost(
+        llvm::formatv("DispatchIndirect offset={0}", Offset).str());
+    vkCmdDispatchIndirect(CB.CmdBuffer, VKBuf.Buffer,
+                          static_cast<VkDeviceSize>(Offset));
+    return llvm::Error::success();
+  }
+
   llvm::Error copyBufferToBuffer(offloadtest::Buffer &Src, size_t SrcOffset,
                                  offloadtest::Buffer &Dst, size_t DstOffset,
                                  size_t Size) override {
@@ -719,6 +733,19 @@ public:
     addDstBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
     insertDebugSignpost(llvm::formatv("CopyBuffer {0}B", Size).str());
     vkCmdCopyBuffer(CB.CmdBuffer, VKSrc.Buffer, VKDst.Buffer, 1, &Region);
+    return llvm::Error::success();
+  }
+
+  llvm::Error fillBuffer(offloadtest::Buffer &Dst, size_t Offset, size_t Size,
+                         uint8_t Value) override {
+    auto &VKDst = static_cast<VulkanBuffer &>(Dst);
+    // Broadcast the byte value across all four bytes of the uint32_t that
+    // vkCmdFillBuffer writes repeatedly.
+    const uint32_t Data = uint32_t(Value) * 0x01010101u;
+    addDstBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    insertDebugSignpost(
+        llvm::formatv("FillBuffer {0}B value=0x{1:x2}", Size, Value).str());
+    vkCmdFillBuffer(CB.CmdBuffer, VKDst.Buffer, Offset, Size, Data);
     return llvm::Error::success();
   }
 

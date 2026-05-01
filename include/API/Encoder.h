@@ -48,6 +48,11 @@ public:
                                          Buffer &Dst, size_t DstOffset,
                                          size_t Size) = 0;
 
+  /// Fill \p Size bytes of \p Dst starting at \p Offset with \p Value.
+  /// \p Offset and \p Size must be multiples of 4.
+  virtual llvm::Error fillBuffer(Buffer &Dst, size_t Offset, size_t Size,
+                                 uint8_t Value) = 0;
+
   /// Begin a named debug group. Visible in GPU debuggers (PIX, RenderDoc,
   /// Xcode). Must be balanced by a corresponding popDebugGroup() call.
   virtual void pushDebugGroup(llvm::StringRef Label) {}
@@ -80,6 +85,11 @@ public:
   /// pipeline state (e.g. the shader's numthreads attribute).
   virtual llvm::Error dispatch(uint32_t GroupCountX, uint32_t GroupCountY,
                                uint32_t GroupCountZ) = 0;
+
+  /// Dispatch a compute grid indirectly. The buffer at \p Offset must contain
+  /// three uint32_t values: {GroupCountX, GroupCountY, GroupCountZ}. The
+  /// workgroup size is derived from the bound pipeline state.
+  virtual llvm::Error dispatchIndirect(Buffer &ArgBuffer, size_t Offset) = 0;
 };
 
 } // namespace offloadtest
