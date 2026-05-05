@@ -434,6 +434,15 @@ public:
     vkFreeMemory(Dev, Memory, nullptr);
   }
 
+  // Only valid when the buffer was created with VK_BUFFER_USAGE_SHADER_DEVICE_
+  // ADDRESS_BIT, which the device adds whenever ray tracing is supported.
+  VkDeviceAddress getDeviceAddress() const {
+    VkBufferDeviceAddressInfo Info = {};
+    Info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+    Info.buffer = Buffer;
+    return vkGetBufferDeviceAddress(Dev, &Info);
+  }
+
   static bool classof(const offloadtest::Buffer *B) {
     return B->getAPI() == GPUAPI::Vulkan;
   }
@@ -593,9 +602,15 @@ public:
       override;
 };
 
+class VulkanDevice; // forward decl — defined below in this same anon ns
+
 class VulkanCommandBuffer : public offloadtest::CommandBuffer {
 public:
   VkDevice Device = VK_NULL_HANDLE;
+  // Back-pointer to the owning device. Used by encoders that need access to
+  // device-loaded function pointers (e.g. ray-tracing entry points) and
+  // helper allocators.
+  VulkanDevice *Dev = nullptr;
   // Owned per command buffer so that recording, submission, and lifetime
   // management of each command buffer are independently safe without external
   // synchronization.
@@ -683,7 +698,24 @@ public:
     PendingDstAccess = 0;
   }
 
+  /// Raw VkBuffer/VkDeviceMemory pairs (e.g. AS scratch buffers allocated
+  /// directly via VulkanDevice::createBufferWithDeviceAddress) that must
+  /// outlive command-buffer submission and are freed at CB destruction.
+  struct OwnedBuffer {
+    VkBuffer Buffer;
+    VkDeviceMemory Memory;
+  };
+  llvm::SmallVector<OwnedBuffer> KeepAliveBuffers;
+  /// Abstract-API Buffer wrappers (e.g. the TLAS instance array buffer) that
+  /// must outlive submission. Held as unique_ptr so the wrapper destructor
+  /// frees both the VkBuffer and VkDeviceMemory.
+  llvm::SmallVector<std::unique_ptr<offloadtest::Buffer>> KeepAliveOwned;
+
   ~VulkanCommandBuffer() override {
+    for (auto &B : KeepAliveBuffers) {
+      vkDestroyBuffer(Device, B.Buffer, nullptr);
+      vkFreeMemory(Device, B.Memory, nullptr);
+    }
     if (CmdPool != VK_NULL_HANDLE)
       vkDestroyCommandPool(Device, CmdPool, nullptr);
   }
@@ -766,6 +798,10 @@ public:
     return llvm::Error::success();
   }
 
+  // Defined out-of-line below — needs VulkanDevice's full type for access to
+  // the device-loaded ray-tracing entry points and helpers.
+  llvm::Error batchBuildAS(llvm::ArrayRef<ASBuildItem> Items) override;
+
   void endEncodingImpl() override { popDebugGroup(); }
 };
 
@@ -806,6 +842,10 @@ public:
   }
 };
 class VulkanDevice : public offloadtest::Device {
+  // VKComputeEncoder needs access to the device's RT entry points and the
+  // raw VkDevice handle to record acceleration-structure build commands.
+  friend class VKComputeEncoder;
+
 private:
   std::shared_ptr<VulkanInstance> Instance;
   VkPhysicalDevice PhysicalDevice = VK_NULL_HANDLE;
@@ -914,6 +954,8 @@ private:
     // Built acceleration structures, kept alive for the pipeline lifetime.
     llvm::SmallVector<std::unique_ptr<offloadtest::AccelerationStructure>>
         AccelStructs;
+    // Vertex/index buffers consumed during AS builds; must outlive submission.
+    llvm::SmallVector<std::unique_ptr<offloadtest::Buffer>> ASInputBuffers;
   };
 
 public:
@@ -1586,6 +1628,13 @@ public:
                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
       break;
     }
+    // When ray tracing is supported, every buffer is eligible to act as an
+    // acceleration-structure build input and to expose a device address. The
+    // shared AS build helper assumes Storage buffers carry these flags.
+    if (HasRayTracingSupport)
+      BufInfo.usage |=
+          VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+          VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
     BufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
     VkBuffer DeviceBuffer;
@@ -1597,8 +1646,14 @@ public:
     VkMemoryRequirements MemReqs;
     vkGetBufferMemoryRequirements(Device, DeviceBuffer, &MemReqs);
 
+    VkMemoryAllocateFlagsInfo AllocFlagsInfo = {};
+    AllocFlagsInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+    AllocFlagsInfo.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+
     VkMemoryAllocateInfo AllocInfo = {};
     AllocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    if (HasRayTracingSupport)
+      AllocInfo.pNext = &AllocFlagsInfo;
     AllocInfo.allocationSize = MemReqs.size;
     auto MemIdx = getMemoryIndex(PhysicalDevice, MemReqs.memoryTypeBits,
                                  getVulkanMemoryFlags(Desc.Location));
@@ -1795,9 +1850,13 @@ private:
 public:
   llvm::Expected<std::unique_ptr<offloadtest::CommandBuffer>>
   createCommandBuffer() override {
-    return VulkanCommandBuffer::create(
+    auto CBOrErr = VulkanCommandBuffer::create(
         Device, GraphicsQueue.QueueFamilyIdx, CmdBeginDebugUtilsLabel,
         CmdEndDebugUtilsLabel, CmdInsertDebugUtilsLabel);
+    if (!CBOrErr)
+      return CBOrErr.takeError();
+    (*CBOrErr)->Dev = this;
+    return std::unique_ptr<offloadtest::CommandBuffer>(std::move(*CBOrErr));
   }
 
   // Helper: create a buffer with device address support.
@@ -2193,118 +2252,6 @@ public:
       return Err;
 
     return ResourceRef(Host, ImageRef{0, Sampler, 0});
-  }
-
-  llvm::Error createAccelerationStructures(Pipeline &P, InvocationState &IS) {
-    if (P.AccelStructs.BLAS.empty() && P.AccelStructs.TLAS.empty())
-      return llvm::Error::success();
-
-    if (!HasRayTracingSupport)
-      return llvm::createStringError(
-          std::errc::not_supported,
-          "Pipeline defines acceleration structures but ray tracing is not "
-          "supported on this device.");
-
-    // Upload vertex/index data and build each BLAS.
-    llvm::StringMap<size_t> BLASIndex;
-    for (auto &BD : P.AccelStructs.BLAS) {
-      llvm::SmallVector<TriangleGeometryDesc> Triangles;
-      llvm::SmallVector<std::unique_ptr<offloadtest::Buffer>> GeomBuffers;
-
-      for (auto &T : BD.Triangles) {
-        assert(T.VertexBufferPtr && "VertexBufferPtr not resolved");
-        BufferCreateDesc BufDesc{MemoryLocation::CpuToGpu,
-                                 BufferUsage::Storage};
-        auto VBOrErr =
-            createBuffer("AS-Vertices", BufDesc, T.VertexBufferPtr->size());
-        if (!VBOrErr)
-          return VBOrErr.takeError();
-        auto &VB = *VBOrErr;
-        auto PtrOrErr = VB->map();
-        if (!PtrOrErr)
-          return PtrOrErr.takeError();
-        memcpy(*PtrOrErr, T.VertexBufferPtr->Data[0].get(),
-               T.VertexBufferPtr->size());
-        if (auto Err = VB->unmap())
-          return std::move(Err);
-
-        TriangleGeometryDesc Desc;
-        Desc.VertexBuffer = VB.get();
-        Desc.VertexCount = T.VertexCount;
-        Desc.VertexStride = T.VertexStride;
-        Desc.VertexFormat = T.VertexFormat;
-        Desc.Opaque = T.Opaque;
-
-        if (T.IndexBufferPtr) {
-          auto IBOrErr =
-              createBuffer("AS-Indices", BufDesc, T.IndexBufferPtr->size());
-          if (!IBOrErr)
-            return IBOrErr.takeError();
-          auto &IB = *IBOrErr;
-          auto IPtrOrErr = IB->map();
-          if (!IPtrOrErr)
-            return IPtrOrErr.takeError();
-          memcpy(*IPtrOrErr, T.IndexBufferPtr->Data[0].get(),
-                 T.IndexBufferPtr->size());
-          if (auto Err = IB->unmap())
-            return std::move(Err);
-          Desc.IndexBuffer = IB.get();
-          Desc.IndexCount = T.IndexCount;
-          Desc.IdxFormat = T.IdxFormat;
-          GeomBuffers.push_back(std::move(IB));
-        }
-
-        Triangles.push_back(Desc);
-        GeomBuffers.push_back(std::move(VB));
-      }
-
-      // TODO: AABB geometry support.
-
-      auto ReqOrErr = createBLASBuildRequest(Triangles, {}, BuildFlagNone);
-      if (!ReqOrErr)
-        return ReqOrErr.takeError();
-
-      auto ASOrErr = createAccelerationStructure(*ReqOrErr);
-      if (!ASOrErr)
-        return ASOrErr.takeError();
-
-      BLASIndex[BD.Name] = IS.AccelStructs.size();
-      IS.AccelStructs.push_back(std::move(*ASOrErr));
-      llvm::outs() << "Created BLAS '" << BD.Name << "'.\n";
-    }
-
-    // Build each TLAS referencing the BLASes.
-    for (auto &TD : P.AccelStructs.TLAS) {
-      llvm::SmallVector<AccelerationStructureInstance> Instances;
-      for (auto &Inst : TD.Instances) {
-        auto It = BLASIndex.find(Inst.BLAS);
-        if (It == BLASIndex.end())
-          return llvm::createStringError(
-              std::errc::invalid_argument,
-              "TLAS '%s' references unknown BLAS '%s'", TD.Name.c_str(),
-              Inst.BLAS.c_str());
-
-        AccelerationStructureInstance ASInst;
-        memcpy(ASInst.Transform, Inst.Transform, sizeof(ASInst.Transform));
-        ASInst.InstanceID = Inst.InstanceID;
-        ASInst.InstanceMask = Inst.InstanceMask;
-        ASInst.BLAS = IS.AccelStructs[It->second].get();
-        Instances.push_back(ASInst);
-      }
-
-      auto ReqOrErr = createTLASBuildRequest(Instances, BuildFlagNone);
-      if (!ReqOrErr)
-        return ReqOrErr.takeError();
-
-      auto ASOrErr = createAccelerationStructure(*ReqOrErr);
-      if (!ASOrErr)
-        return ASOrErr.takeError();
-
-      IS.AccelStructs.push_back(std::move(*ASOrErr));
-      llvm::outs() << "Created TLAS '" << TD.Name << "'.\n";
-    }
-
-    return llvm::Error::success();
   }
 
   llvm::Error createResource(Resource &R, InvocationState &IS) {
@@ -3394,10 +3341,18 @@ public:
     if (!CBOrErr)
       return CBOrErr.takeError();
     State.CB = std::move(*CBOrErr);
+    State.CB->Dev = this;
     llvm::outs() << "Command buffer created.\n";
 
-    if (auto Err = createAccelerationStructures(P, State))
-      return Err;
+    if (!P.AccelStructs.BLAS.empty() || !P.AccelStructs.TLAS.empty()) {
+      auto EncOrErr = State.CB->createComputeEncoder();
+      if (!EncOrErr)
+        return EncOrErr.takeError();
+      if (auto Err = offloadtest::buildPipelineAccelerationStructures(
+              *this, **EncOrErr, P, State.AccelStructs, State.ASInputBuffers))
+        return Err;
+      (*EncOrErr)->endEncoding();
+    }
 
     if (auto Err = createResources(P, State))
       return Err;
@@ -3520,6 +3475,7 @@ public:
     if (!DispatchCBOrErr)
       return DispatchCBOrErr.takeError();
     State.CB = std::move(*DispatchCBOrErr);
+    State.CB->Dev = this;
     llvm::outs() << "Execute command buffer created.\n";
     if (auto Err = createDescriptorPool(P, State))
       return Err;
@@ -3543,6 +3499,178 @@ public:
     return llvm::Error::success();
   }
 };
+
+llvm::Error VKComputeEncoder::batchBuildAS(llvm::ArrayRef<ASBuildItem> Items) {
+  if (Items.empty())
+    return llvm::Error::success();
+  if (!CB.Dev || !CB.Dev->FnCmdBuildAS)
+    return llvm::createStringError(
+        std::errc::not_supported,
+        "Ray tracing not supported on this command buffer's device.");
+  VulkanDevice *Dev = CB.Dev;
+
+  // Pre-call barrier: ensure prior writes complete before AS-build reads.
+  // This also rotates AS-build-write into the next pending-src slot, so a
+  // subsequent dispatch reading the AS will get the right barrier.
+  addDstBarrier(VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR);
+
+  const size_t N = Items.size();
+  // Per-item arrays must outlive the FnCmdBuildAS call.
+  llvm::SmallVector<llvm::SmallVector<VkAccelerationStructureGeometryKHR>>
+      Geoms(N);
+  llvm::SmallVector<llvm::SmallVector<VkAccelerationStructureBuildRangeInfoKHR>>
+      Ranges(N);
+  llvm::SmallVector<VkAccelerationStructureBuildGeometryInfoKHR> BuildInfos(N);
+  llvm::SmallVector<const VkAccelerationStructureBuildRangeInfoKHR *> RangePtrs(
+      N);
+
+  for (size_t I = 0; I < N; ++I) {
+    const auto &Item = Items[I];
+    auto *VkAS = llvm::cast<VulkanAccelerationStructure>(Item.AS);
+
+    auto &BI = BuildInfos[I];
+    BI.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+    BI.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    BI.dstAccelerationStructure = VkAS->AccelStruct;
+
+    uint64_t ScratchSize = 0;
+    if (const auto *BLAS = llvm::dyn_cast<const BLASBuildRequest *>(Item.Req)) {
+      BI.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+      BI.flags = getVulkanASBuildFlags(BLAS->Flags);
+
+      Geoms[I].reserve(BLAS->Triangles.size() + BLAS->AABBs.size());
+      Ranges[I].reserve(BLAS->Triangles.size() + BLAS->AABBs.size());
+
+      for (const auto &T : BLAS->Triangles) {
+        VkAccelerationStructureGeometryKHR G = {};
+        G.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+        G.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+        if (T.Opaque)
+          G.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+        auto &Tri = G.geometry.triangles;
+        Tri.sType =
+            VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+        auto *VB = llvm::cast<VulkanBuffer>(T.VertexBuffer);
+        Tri.vertexFormat = getVulkanFormat(T.VertexFormat);
+        Tri.vertexData.deviceAddress =
+            VB->getDeviceAddress() + T.VertexBufferOffset;
+        Tri.vertexStride = T.VertexStride;
+        Tri.maxVertex = T.VertexCount - 1;
+        if (T.IndexBuffer) {
+          auto *IB = llvm::cast<VulkanBuffer>(T.IndexBuffer);
+          Tri.indexType = getVulkanIndexType(T.IdxFormat);
+          Tri.indexData.deviceAddress =
+              IB->getDeviceAddress() + T.IndexBufferOffset;
+        } else {
+          Tri.indexType = VK_INDEX_TYPE_NONE_KHR;
+        }
+        Geoms[I].push_back(G);
+
+        VkAccelerationStructureBuildRangeInfoKHR R = {};
+        R.primitiveCount = T.IndexBuffer ? T.IndexCount / 3 : T.VertexCount / 3;
+        Ranges[I].push_back(R);
+      }
+      for (const auto &A : BLAS->AABBs) {
+        VkAccelerationStructureGeometryKHR G = {};
+        G.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+        G.geometryType = VK_GEOMETRY_TYPE_AABBS_KHR;
+        if (A.Opaque)
+          G.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+        auto &Ab = G.geometry.aabbs;
+        Ab.sType =
+            VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_AABBS_DATA_KHR;
+        Ab.stride = A.AABBStride;
+        auto *AB = llvm::cast<VulkanBuffer>(A.AABBBuffer);
+        Ab.data.deviceAddress = AB->getDeviceAddress() + A.AABBBufferOffset;
+        Geoms[I].push_back(G);
+
+        VkAccelerationStructureBuildRangeInfoKHR R = {};
+        R.primitiveCount = A.AABBCount;
+        Ranges[I].push_back(R);
+      }
+
+      BI.geometryCount = Geoms[I].size();
+      BI.pGeometries = Geoms[I].data();
+      ScratchSize = BLAS->Sizes.ScratchDataSizeInBytes;
+    } else {
+      const auto *TLAS = llvm::cast<const TLASBuildRequest *>(Item.Req);
+      BI.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+      BI.flags = getVulkanASBuildFlags(TLAS->Flags);
+
+      // Serialize instances into the Vulkan-native struct.
+      llvm::SmallVector<VkAccelerationStructureInstanceKHR> Native;
+      Native.reserve(TLAS->Instances.size());
+      for (const auto &Inst : TLAS->Instances) {
+        VkAccelerationStructureInstanceKHR NI = {};
+        static_assert(sizeof(NI.transform.matrix) == sizeof(Inst.Transform),
+                      "Transform layout mismatch");
+        memcpy(&NI.transform.matrix, Inst.Transform, sizeof(Inst.Transform));
+        NI.instanceCustomIndex = Inst.InstanceID & 0xFFFFFFu;
+        NI.mask = Inst.InstanceMask;
+        NI.instanceShaderBindingTableRecordOffset = 0;
+        NI.flags = 0;
+        auto *BLASPtr = llvm::cast<VulkanAccelerationStructure>(Inst.BLAS);
+        NI.accelerationStructureReference = BLASPtr->getDeviceAddress();
+        Native.push_back(NI);
+      }
+      const size_t Bytes =
+          Native.size() * sizeof(VkAccelerationStructureInstanceKHR);
+
+      // Upload the instance array. Storage + CpuToGpu now carries device
+      // address and AS-build-input flags (because RT is supported).
+      BufferCreateDesc Desc{MemoryLocation::CpuToGpu, BufferUsage::Storage};
+      auto InstBufOrErr = offloadtest::createBufferWithData(
+          *Dev, "TLAS-Instances", Desc,
+          llvm::ArrayRef<uint8_t>(
+              reinterpret_cast<const uint8_t *>(Native.data()), Bytes));
+      if (!InstBufOrErr)
+        return InstBufOrErr.takeError();
+      auto *VkInstBuf = llvm::cast<VulkanBuffer>(InstBufOrErr->get());
+
+      VkAccelerationStructureGeometryKHR G = {};
+      G.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+      G.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+      auto &Inst = G.geometry.instances;
+      Inst.sType =
+          VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+      Inst.arrayOfPointers = VK_FALSE;
+      Inst.data.deviceAddress = VkInstBuf->getDeviceAddress();
+      Geoms[I].push_back(G);
+
+      VkAccelerationStructureBuildRangeInfoKHR R = {};
+      R.primitiveCount = static_cast<uint32_t>(TLAS->Instances.size());
+      Ranges[I].push_back(R);
+
+      BI.geometryCount = 1;
+      BI.pGeometries = Geoms[I].data();
+      ScratchSize = TLAS->Sizes.ScratchDataSizeInBytes;
+
+      // Keep the instance buffer alive across submission.
+      CB.KeepAliveOwned.push_back(std::move(*InstBufOrErr));
+    }
+
+    // Allocate scratch (one per item; non-overlapping ranges as required).
+    auto ScratchOrErr = Dev->createBufferWithDeviceAddress(
+        ScratchSize, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    if (!ScratchOrErr)
+      return ScratchOrErr.takeError();
+    VkBufferDeviceAddressInfo ScrAddr = {};
+    ScrAddr.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+    ScrAddr.buffer = ScratchOrErr->Buffer;
+    BI.scratchData.deviceAddress =
+        vkGetBufferDeviceAddress(Dev->Device, &ScrAddr);
+    CB.KeepAliveBuffers.push_back({ScratchOrErr->Buffer, ScratchOrErr->Memory});
+
+    RangePtrs[I] = Ranges[I].data();
+  }
+
+  insertDebugSignpost(
+      llvm::formatv("BuildAccelerationStructures x{0}", N).str());
+  Dev->FnCmdBuildAS(CB.CmdBuffer, static_cast<uint32_t>(N), BuildInfos.data(),
+                    RangePtrs.data());
+  return llvm::Error::success();
+}
 } // namespace
 
 llvm::Expected<offloadtest::SubmitResult> VulkanQueue::submit(
