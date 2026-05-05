@@ -83,12 +83,6 @@ Buffers:
   #   v_nopers = (1/6)*12         = 2.0
   #   v_flat   = V_0              = 12.0   (provoking vertex)
   #   v_centro = v_lin            = 3.0    (no MSAA -> sample = pixel center)
-  #
-  # The PS captures the four interpolated values into a UAV-bound
-  # RWStructuredBuffer rather than packing them into SV_TARGET, because the
-  # framework's RT readback path can't carry HDR-range float values through
-  # its PNG-color-clamped output, and we want >[0,1] values to make the
-  # perspective vs no-perspective contrast obvious.
   - Name: VertexData
     Format: Float32
     Stride: 20  # float4 pos (16 bytes) + float v (4 bytes)
