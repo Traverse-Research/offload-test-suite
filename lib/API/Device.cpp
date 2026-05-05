@@ -93,27 +93,38 @@ offloadtest::createRenderTargetFromCPUBuffer(Device &Dev,
 }
 
 llvm::Expected<std::unique_ptr<Buffer>>
+offloadtest::createBufferWithData(Device &Dev, llvm::StringRef Name,
+                                  const BufferCreateDesc &Desc,
+                                  llvm::ArrayRef<uint8_t> Data) {
+  BufferCreateDesc Mut = Desc;
+  auto BufOrErr = Dev.createBuffer(Name.str(), Mut, Data.size());
+  if (!BufOrErr)
+    return BufOrErr.takeError();
+  auto Buf = std::move(*BufOrErr);
+
+  auto PtrOrErr = Buf->map();
+  if (!PtrOrErr)
+    return PtrOrErr.takeError();
+  memcpy(*PtrOrErr, Data.data(), Data.size());
+  if (auto Err = Buf->unmap())
+    return std::move(Err);
+
+  return Buf;
+}
+
+llvm::Expected<std::unique_ptr<Buffer>>
 offloadtest::createVertexBufferFromCPUBuffer(Device &Dev,
                                              const CPUBuffer &Buf) {
   BufferCreateDesc BufDesc = {};
   BufDesc.Location = MemoryLocation::CpuToGpu;
   BufDesc.Usage = BufferUsage::VertexBuffer;
-  auto BufOrErr = Dev.createBuffer("VertexBuffer", BufDesc, Buf.size());
-  if (!BufOrErr)
-    return BufOrErr.takeError();
-  auto VB = std::move(*BufOrErr);
-
   // TODO: Currently uses a single CpuToGpu mapped buffer.
   // On discrete GPUs consider using a staging buffer + copy to a GpuOnly vertex
   // buffer for optimal GPU read performance.
-  auto PtrOrErr = VB->map();
-  if (!PtrOrErr)
-    return PtrOrErr.takeError();
-  memcpy(*PtrOrErr, Buf.Data[0].get(), Buf.size());
-  if (auto Err = VB->unmap())
-    return std::move(Err);
-
-  return VB;
+  return createBufferWithData(
+      Dev, "VertexBuffer", BufDesc,
+      llvm::ArrayRef<uint8_t>(
+          reinterpret_cast<const uint8_t *>(Buf.Data[0].get()), Buf.size()));
 }
 
 llvm::Expected<std::unique_ptr<Texture>>

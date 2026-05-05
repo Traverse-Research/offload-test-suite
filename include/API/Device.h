@@ -228,6 +228,13 @@ createDefaultDepthStencilTarget(Device &Dev, uint32_t Width, uint32_t Height);
 llvm::Expected<std::unique_ptr<Buffer>>
 createVertexBufferFromCPUBuffer(Device &Dev, const CPUBuffer &Buf);
 
+// Creates a buffer with the given description and uploads `Data` into it.
+// Maps the buffer (must be CpuToGpu), memcpys, and unmaps.
+llvm::Expected<std::unique_ptr<Buffer>>
+createBufferWithData(Device &Dev, llvm::StringRef Name,
+                     const BufferCreateDesc &Desc,
+                     llvm::ArrayRef<uint8_t> Data);
+
 } // namespace offloadtest
 
 #endif // OFFLOADTEST_API_DEVICE_H
