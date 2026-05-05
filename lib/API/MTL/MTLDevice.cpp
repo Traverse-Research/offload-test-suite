@@ -364,17 +364,14 @@ class MTLDevice : public offloadtest::Device {
       }
       IS.ArgBuffer->didModifyRange(NS::Range::Make(0, IS.ArgBuffer->length()));
     }
-    if (P.isTraditionalRaster()) {
-      if (!P.Bindings.VertexBufferPtr)
-        return llvm::createStringError(
-            std::errc::invalid_argument,
-            "No vertex buffer specified for graphics pipeline.");
 
+    if (P.isTraditionalRaster() && P.Bindings.VertexBufferPtr) {
       auto VBOrErr = offloadtest::createVertexBufferFromCPUBuffer(
           *this, *P.Bindings.VertexBufferPtr);
       if (!VBOrErr)
         return VBOrErr.takeError();
       IS.VB = std::move(*VBOrErr);
+      llvm::outs() << "Vertex buffer created.\n";
     }
     return llvm::Error::success();
   }

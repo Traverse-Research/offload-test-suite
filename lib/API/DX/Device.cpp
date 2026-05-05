@@ -1590,6 +1590,16 @@ public:
       if (auto Err = CreateBuffer(Resource, IS.RootResources))
         return Err;
     }
+
+    if (P.isTraditionalRaster() && P.Bindings.VertexBufferPtr) {
+      auto VBOrErr = offloadtest::createVertexBufferFromCPUBuffer(
+          *this, *P.Bindings.VertexBufferPtr);
+      if (!VBOrErr)
+        return VBOrErr.takeError();
+      IS.VB = std::move(*VBOrErr);
+      llvm::outs() << "Vertex buffer created.\n";
+    }
+
     return llvm::Error::success();
   }
 
@@ -1881,38 +1891,10 @@ public:
     return llvm::Error::success();
   }
 
-  llvm::Error createVertexBuffer(Pipeline &P, InvocationState &IS) {
-    if (!P.Bindings.VertexBufferPtr)
-      return llvm::createStringError(
-          std::errc::invalid_argument,
-          "No vertex buffer bound for graphics pipeline.");
-
-    auto VBOrErr = offloadtest::createVertexBufferFromCPUBuffer(
-        *this, *P.Bindings.VertexBufferPtr);
-    if (!VBOrErr)
-      return VBOrErr.takeError();
-    IS.VB = std::move(*VBOrErr);
-
-    auto &VBBuf = llvm::cast<DXBuffer>(*IS.VB);
-    D3D12_VERTEX_BUFFER_VIEW VBView = {};
-    VBView.BufferLocation = VBBuf.Buffer->GetGPUVirtualAddress();
-    VBView.SizeInBytes = static_cast<UINT>(IS.VB->getSizeInBytes());
-    VBView.StrideInBytes = P.Bindings.getVertexStride();
-
-    IS.CB->CmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    IS.CB->CmdList->IASetVertexBuffers(0, 1, &VBView);
-
-    return llvm::Error::success();
-  }
-
   llvm::Error createGraphicsCommands(Pipeline &P, InvocationState &IS) {
     auto &RT = llvm::cast<DXTexture>(*IS.RT);
     auto &DS = llvm::cast<DXTexture>(*IS.DS);
     auto &RTReadback = llvm::cast<DXBuffer>(*IS.RTReadback);
-
-    if (!IS.VB)
-      return llvm::createStringError(std::errc::invalid_argument,
-                                     "Vertex buffer not initialized.");
 
     const DXPipelineState &DXPipeline =
         llvm::cast<DXPipelineState>(*IS.Pipeline.get());
@@ -1950,6 +1932,17 @@ public:
     const D3D12_RECT Scissor = {0, 0, static_cast<LONG>(VP.Width),
                                 static_cast<LONG>(VP.Height)};
     IS.CB->CmdList->RSSetScissorRects(1, &Scissor);
+
+    if (IS.VB) {
+      auto &VBBuf = llvm::cast<DXBuffer>(*IS.VB);
+      D3D12_VERTEX_BUFFER_VIEW VBView = {};
+      VBView.BufferLocation = VBBuf.Buffer->GetGPUVirtualAddress();
+      VBView.SizeInBytes = static_cast<UINT>(IS.VB->getSizeInBytes());
+      VBView.StrideInBytes = P.Bindings.getVertexStride();
+      IS.CB->CmdList->IASetVertexBuffers(0, 1, &VBView);
+    }
+
+    IS.CB->CmdList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
     IS.CB->CmdList->DrawInstanced(P.getVertexCount(), 1, 0, 0);
 
@@ -2078,9 +2071,6 @@ public:
       if (auto Err = createDepthStencil(P, State))
         return Err;
       llvm::outs() << "Depth stencil created.\n";
-      if (auto Err = createVertexBuffer(P, State))
-        return Err;
-      llvm::outs() << "Vertex buffer created.\n";
 
       ShaderContainer VS = {};
       ShaderContainer PS = {};
