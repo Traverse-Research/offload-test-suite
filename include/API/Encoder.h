@@ -11,6 +11,8 @@
 
 #include "API/API.h"
 
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/PointerUnion.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/Error.h"
 
@@ -20,6 +22,19 @@
 namespace offloadtest {
 
 class Buffer;
+class AccelerationStructure;
+struct BLASBuildRequest;
+struct TLASBuildRequest;
+
+/// One acceleration-structure build to record in a batch. The caller is
+/// responsible for ensuring no item in a batch has a memory dependency on
+/// another (e.g. a TLAS that reads a BLAS being built in the same batch must
+/// be in a separate batch — that barrier is inserted between batchBuildAS
+/// calls automatically).
+struct ASBuildItem {
+  AccelerationStructure *AS;
+  llvm::PointerUnion<const BLASBuildRequest *, const TLASBuildRequest *> Req;
+};
 
 /// Base class for all command encoders. An encoder records commands into a
 /// command buffer. Call endEncoding() when done recording. Barriers are
@@ -80,6 +95,14 @@ public:
   /// pipeline state (e.g. the shader's numthreads attribute).
   virtual llvm::Error dispatch(uint32_t GroupCountX, uint32_t GroupCountY,
                                uint32_t GroupCountZ) = 0;
+
+  /// Build a batch of acceleration structures in a single barrier slot. All
+  /// items in `Items` must be independent — no item may depend on another's
+  /// build output. Backends may issue this as one native batch call (Vulkan)
+  /// or as a sequence of single-AS calls without intermediate barriers (DX12,
+  /// Metal). A barrier covering AS-build writes is implicitly emitted before
+  /// any subsequent command that reads from the freshly-built structures.
+  virtual llvm::Error batchBuildAS(llvm::ArrayRef<ASBuildItem> Items) = 0;
 };
 
 } // namespace offloadtest

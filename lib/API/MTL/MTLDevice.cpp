@@ -319,9 +319,18 @@ public:
   }
 };
 
+class MTLDevice; // forward decl — defined below in this same anon ns
+
 class MTLCommandBuffer : public offloadtest::CommandBuffer {
 public:
   MTL::CommandBuffer *CmdBuffer = nullptr;
+  /// Back-pointer to the owning device; used by encoders that need to
+  /// allocate scratch / instance buffers for AS builds.
+  MTLDevice *Dev = nullptr;
+  /// MTL::Buffer objects (e.g. AS scratch and TLAS instance buffers) that
+  /// must outlive command-buffer submission. Released when the CB is
+  /// destroyed.
+  llvm::SmallVector<MTL::Buffer *> KeepAliveMTLBuffers;
 
   static llvm::Expected<std::unique_ptr<MTLCommandBuffer>>
   create(MTL::CommandQueue *Queue) {
@@ -333,7 +342,11 @@ public:
     return CB;
   }
 
-  ~MTLCommandBuffer() override = default;
+  ~MTLCommandBuffer() override {
+    for (auto *B : KeepAliveMTLBuffers)
+      if (B)
+        B->release();
+  }
 
   static bool classof(const CommandBuffer *CB) {
     return CB->getKind() == GPUAPI::Metal;
@@ -394,9 +407,13 @@ llvm::Expected<offloadtest::SubmitResult> MTLQueue::submit(
 }
 
 class MTLComputeEncoder : public offloadtest::ComputeEncoder {
+  MTLCommandBuffer *CB = nullptr;
   MTL::CommandBuffer *CmdBuffer;
   MTL::ComputeCommandEncoder *ComputeEnc = nullptr;
   MTL::BlitCommandEncoder *BlitEnc = nullptr;
+  /// Lazy AS encoder, created when batchBuildAS is called and torn down at
+  /// the next encoder transition (via endEncodingImpl).
+  MTL::AccelerationStructureCommandEncoder *ASEnc = nullptr;
 
   /// Threadgroup size from shader reflection (the numthreads() attribute
   /// persisted in the transpiled Metallib). Must be set via
@@ -446,9 +463,9 @@ class MTLComputeEncoder : public offloadtest::ComputeEncoder {
   }
 
 public:
-  MTLComputeEncoder(MTL::CommandBuffer *CmdBuffer,
+  MTLComputeEncoder(MTLCommandBuffer *CB, MTL::CommandBuffer *CmdBuffer,
                     MTL::ComputeCommandEncoder *Encoder)
-      : ComputeEncoder(GPUAPI::Metal), CmdBuffer(CmdBuffer),
+      : ComputeEncoder(GPUAPI::Metal), CB(CB), CmdBuffer(CmdBuffer),
         ComputeEnc(Encoder) {}
 
   ~MTLComputeEncoder() override { endEncoding(); }
@@ -518,6 +535,24 @@ public:
     return llvm::Error::success();
   }
 
+  // Defined out-of-line below — needs MTLDevice's full type for access to the
+  // MTL::Device handle (used to allocate scratch and instance buffers).
+  llvm::Error batchBuildAS(llvm::ArrayRef<ASBuildItem> Items) override;
+
+  /// Lazily transition into an AccelerationStructureCommandEncoder; mirrors
+  /// the existing compute↔blit lazy switch.
+  llvm::Error ensureASEncoder() {
+    if (ASEnc)
+      return llvm::Error::success();
+    endEncodingImpl();
+    ASEnc = CmdBuffer->accelerationStructureCommandEncoder();
+    if (!ASEnc)
+      return llvm::createStringError(
+          std::errc::device_or_resource_busy,
+          "Failed to create Metal acceleration-structure encoder.");
+    return llvm::Error::success();
+  }
+
   void endEncodingImpl() override {
     if (ComputeEnc) {
       flushBarrier();
@@ -528,6 +563,10 @@ public:
     if (BlitEnc) {
       BlitEnc->endEncoding();
       BlitEnc = nullptr;
+    }
+    if (ASEnc) {
+      ASEnc->endEncoding();
+      ASEnc = nullptr;
     }
   }
 };
@@ -542,9 +581,13 @@ MTLCommandBuffer::createComputeEncoder() {
         "Failed to create Metal compute command encoder.");
   NativeEncoder->pushDebugGroup(
       NS::String::string("ComputeEncoder", NS::UTF8StringEncoding));
-  return std::make_unique<MTLComputeEncoder>(CmdBuffer, NativeEncoder);
+  return std::make_unique<MTLComputeEncoder>(this, CmdBuffer, NativeEncoder);
 }
 class MTLDevice : public offloadtest::Device {
+  // MTLComputeEncoder needs access to the MTL::Device handle for AS scratch
+  // and instance buffer allocation.
+  friend class MTLComputeEncoder;
+
   Capabilities Caps;
   MTL::Device *Device;
   MTLQueue GraphicsQueue;
@@ -578,6 +621,12 @@ class MTLDevice : public offloadtest::Device {
 
     llvm::SmallVector<DescriptorTable> DescTables;
     // TODO: Support RootResources?
+
+    // Built acceleration structures, kept alive for the pipeline lifetime.
+    llvm::SmallVector<std::unique_ptr<offloadtest::AccelerationStructure>>
+        AccelStructs;
+    // Vertex/index buffers consumed during AS builds; must outlive submission.
+    llvm::SmallVector<std::unique_ptr<offloadtest::Buffer>> ASInputBuffers;
   };
 
   llvm::Error createRootSignature(
@@ -917,6 +966,12 @@ class MTLDevice : public offloadtest::Device {
         [&IS,
          this](Resource &R,
                llvm::SmallVectorImpl<ResourcePair> &Resources) -> llvm::Error {
+      // Acceleration structures are created separately; descriptor binding for
+      // AS resources is wired up in the per-table binding loop below.
+      if (R.isAccelerationStructure()) {
+        Resources.emplace_back(&R, ResourceBundle{});
+        return llvm::Error::success();
+      }
       switch (getDescriptorKind(R.Kind)) {
       case DescriptorKind::SRV: {
         auto ExRes = createSRV(R, IS);
@@ -959,6 +1014,13 @@ class MTLDevice : public offloadtest::Device {
     uint32_t HeapIndex = 0;
     for (auto &T : IS.DescTables) {
       for (auto &R : T.Resources) {
+        // AS descriptor binding lands in the AS-bind commit; this loop runs
+        // its dedicated path then continues. Advance HeapIndex so subsequent
+        // resources land in the slots the shader's argument buffer expects.
+        if (R.first->isAccelerationStructure()) {
+          HeapIndex += R.first->getArraySize();
+          continue;
+        }
         switch (getDescriptorKind(R.first->Kind)) {
         case DescriptorKind::SRV:
           HeapIndex = bindSRV(*(R.first), IS, HeapIndex, R.second);
@@ -1187,6 +1249,9 @@ class MTLDevice : public offloadtest::Device {
   llvm::Error copyBack(Pipeline &P, InvocationState &IS) {
     auto MemCpyBack = [](ResourcePair &Pair) -> llvm::Error {
       const Resource &R = *Pair.first;
+      // AS resources don't have CPU-side readback data.
+      if (R.isAccelerationStructure())
+        return llvm::Error::success();
       if (!R.isReadWrite())
         return llvm::Error::success();
 
@@ -1278,7 +1343,11 @@ public:
 
   llvm::Expected<std::unique_ptr<offloadtest::CommandBuffer>>
   createCommandBuffer() override {
-    return MTLCommandBuffer::create(GraphicsQueue.Queue);
+    auto CBOrErr = MTLCommandBuffer::create(GraphicsQueue.Queue);
+    if (!CBOrErr)
+      return CBOrErr.takeError();
+    (*CBOrErr)->Dev = this;
+    return std::unique_ptr<offloadtest::CommandBuffer>(std::move(*CBOrErr));
   }
 
   llvm::Expected<std::unique_ptr<PipelineState>>
@@ -1618,6 +1687,17 @@ public:
     if (!CBOrErr)
       return CBOrErr.takeError();
     IS.CB = std::move(*CBOrErr);
+    IS.CB->Dev = this;
+
+    if (!P.AccelStructs.BLAS.empty() || !P.AccelStructs.TLAS.empty()) {
+      auto EncOrErr = IS.CB->createComputeEncoder();
+      if (!EncOrErr)
+        return EncOrErr.takeError();
+      if (auto Err = offloadtest::buildPipelineAccelerationStructures(
+              *this, **EncOrErr, P, IS.AccelStructs, IS.ASInputBuffers))
+        return Err;
+      (*EncOrErr)->endEncoding();
+    }
 
     if (auto Err = createDescriptorHeap(P, IS))
       return Err;
@@ -1726,6 +1806,149 @@ private:
                              Device->supportsRaytracing())));
   }
 };
+
+llvm::Error MTLComputeEncoder::batchBuildAS(llvm::ArrayRef<ASBuildItem> Items) {
+  if (Items.empty())
+    return llvm::Error::success();
+  if (!CB || !CB->Dev)
+    return llvm::createStringError(
+        std::errc::not_supported,
+        "Metal command buffer has no associated MTLDevice.");
+  MTL::Device *MTLDev = CB->Dev->Device;
+  if (!MTLDev->supportsRaytracing())
+    return llvm::createStringError(
+        std::errc::not_supported,
+        "Ray tracing is not supported on this Metal device.");
+
+  if (auto Err = ensureASEncoder())
+    return Err;
+
+  for (const auto &Item : Items) {
+    auto *AS = llvm::cast<MTLAccelStruct>(Item.AS);
+    MTL::AccelerationStructureDescriptor *Desc = nullptr;
+    uint64_t ScratchSize = 0;
+
+    if (const auto *BLAS = llvm::dyn_cast<const BLASBuildRequest *>(Item.Req)) {
+      llvm::SmallVector<MTL::AccelerationStructureGeometryDescriptor *> Geoms;
+      for (const auto &T : BLAS->Triangles) {
+        auto *TD = MTL::AccelerationStructureTriangleGeometryDescriptor::alloc()
+                       ->init();
+        auto *VB = llvm::cast<MTLBuffer>(T.VertexBuffer);
+        TD->setVertexBuffer(VB->Buf);
+        TD->setVertexBufferOffset(T.VertexBufferOffset);
+        TD->setVertexStride(T.VertexStride);
+        TD->setVertexFormat(getMetalPositionFormat(T.VertexFormat));
+        TD->setTriangleCount(T.IndexBuffer ? T.IndexCount / 3
+                                           : T.VertexCount / 3);
+        if (T.IndexBuffer) {
+          auto *IB = llvm::cast<MTLBuffer>(T.IndexBuffer);
+          TD->setIndexBuffer(IB->Buf);
+          TD->setIndexBufferOffset(T.IndexBufferOffset);
+          TD->setIndexType(getMetalIndexType(T.IdxFormat));
+        }
+        TD->setOpaque(T.Opaque);
+        Geoms.push_back(TD);
+      }
+      for (const auto &A : BLAS->AABBs) {
+        auto *AD =
+            MTL::AccelerationStructureBoundingBoxGeometryDescriptor::alloc()
+                ->init();
+        auto *BB = llvm::cast<MTLBuffer>(A.AABBBuffer);
+        AD->setBoundingBoxBuffer(BB->Buf);
+        AD->setBoundingBoxBufferOffset(A.AABBBufferOffset);
+        AD->setBoundingBoxStride(A.AABBStride);
+        AD->setBoundingBoxCount(A.AABBCount);
+        AD->setOpaque(A.Opaque);
+        Geoms.push_back(AD);
+      }
+      auto *PD = MTL::PrimitiveAccelerationStructureDescriptor::alloc()->init();
+      NS::Array *GeomArr = NS::Array::array(
+          reinterpret_cast<NS::Object *const *>(Geoms.data()), Geoms.size());
+      PD->setGeometryDescriptors(GeomArr);
+      Desc = PD;
+      ScratchSize = BLAS->Sizes.ScratchDataSizeInBytes;
+      for (auto *G : Geoms)
+        G->release();
+    } else {
+      const auto *TLAS = llvm::cast<const TLASBuildRequest *>(Item.Req);
+
+      // Metal's MTLAccelerationStructureInstanceDescriptor references BLASes
+      // by index into a separate `instancedAccelerationStructures` array,
+      // not by GPU address. Deduplicate the BLAS pointers and remember
+      // their indices.
+      llvm::SmallVector<MTL::AccelerationStructure *> UniqueBLASes;
+      llvm::SmallVector<uint32_t> InstanceASIdx;
+      InstanceASIdx.reserve(TLAS->Instances.size());
+      for (const auto &Inst : TLAS->Instances) {
+        auto *MTLBLAS = llvm::cast<MTLAccelStruct>(Inst.BLAS);
+        auto It = std::find(UniqueBLASes.begin(), UniqueBLASes.end(),
+                            MTLBLAS->AccelStruct);
+        uint32_t Idx;
+        if (It == UniqueBLASes.end()) {
+          Idx = static_cast<uint32_t>(UniqueBLASes.size());
+          UniqueBLASes.push_back(MTLBLAS->AccelStruct);
+        } else {
+          Idx = static_cast<uint32_t>(It - UniqueBLASes.begin());
+        }
+        InstanceASIdx.push_back(Idx);
+      }
+
+      // Pack instance descriptors. Layout differs from VK/DX12: 32-byte
+      // entries with an index instead of a GPU address.
+      const size_t InstByteSize =
+          TLAS->Instances.size() *
+          sizeof(MTL::AccelerationStructureInstanceDescriptor);
+      MTL::Buffer *InstBuf =
+          MTLDev->newBuffer(InstByteSize, MTL::ResourceStorageModeShared);
+      if (!InstBuf)
+        return llvm::createStringError(
+            std::errc::not_enough_memory,
+            "Failed to allocate TLAS instance buffer.");
+      auto *InstPtr =
+          static_cast<MTL::AccelerationStructureInstanceDescriptor *>(
+              InstBuf->contents());
+      for (size_t I = 0; I < TLAS->Instances.size(); ++I) {
+        const auto &Src = TLAS->Instances[I];
+        auto &D = InstPtr[I];
+        // Metal stores transform as packed 4x3 column-major; our high-level
+        // Transform[3][4] is row-major. Transpose into Metal's layout.
+        for (int Row = 0; Row < 3; ++Row)
+          for (int Col = 0; Col < 4; ++Col)
+            D.transformationMatrix.columns[Col][Row] = Src.Transform[Row][Col];
+        D.options = MTL::AccelerationStructureInstanceOptionNone;
+        D.mask = Src.InstanceMask;
+        D.intersectionFunctionTableOffset = 0;
+        D.accelerationStructureIndex = InstanceASIdx[I];
+      }
+      CB->KeepAliveMTLBuffers.push_back(InstBuf);
+
+      auto *ID = MTL::InstanceAccelerationStructureDescriptor::alloc()->init();
+      ID->setInstanceDescriptorBuffer(InstBuf);
+      ID->setInstanceCount(TLAS->Instances.size());
+      NS::Array *BLASArr = NS::Array::array(
+          reinterpret_cast<NS::Object *const *>(UniqueBLASes.data()),
+          UniqueBLASes.size());
+      ID->setInstancedAccelerationStructures(BLASArr);
+      Desc = ID;
+      ScratchSize = TLAS->Sizes.ScratchDataSizeInBytes;
+    }
+
+    MTL::Buffer *Scratch =
+        MTLDev->newBuffer(ScratchSize, MTL::ResourceStorageModePrivate);
+    if (!Scratch) {
+      Desc->release();
+      return llvm::createStringError(std::errc::not_enough_memory,
+                                     "Failed to allocate AS scratch buffer.");
+    }
+    CB->KeepAliveMTLBuffers.push_back(Scratch);
+
+    insertDebugSignpost("BuildAccelerationStructure");
+    ASEnc->buildAccelerationStructure(AS->AccelStruct, Desc, Scratch, 0);
+    Desc->release();
+  }
+
+  return llvm::Error::success();
+}
 } // namespace
 
 llvm::Error offloadtest::initializeMetalDevices(
