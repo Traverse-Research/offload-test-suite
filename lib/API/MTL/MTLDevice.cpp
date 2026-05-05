@@ -436,11 +436,10 @@ class MTLDevice : public offloadtest::Device {
       }
     }
 
-    const llvm::ArrayRef<int> DispatchSize =
-        llvm::ArrayRef<int>(P.Shaders[0].DispatchSize);
     const MTL::Size GridSize =
-        MTL::Size(TGS[0] * DispatchSize[0], TGS[1] * DispatchSize[1],
-                  TGS[2] * DispatchSize[2]);
+        MTL::Size(TGS[0] * P.DispatchParameters.DispatchGroupCount[0],
+                  TGS[1] * P.DispatchParameters.DispatchGroupCount[1],
+                  TGS[2] * P.DispatchParameters.DispatchGroupCount[2]);
     const MTL::Size GroupSize(TGS[0], TGS[1], TGS[2]);
     CmdEncoder->dispatchThreads(GridSize, GroupSize);
     CmdEncoder->memoryBarrier(MTL::BarrierScopeBuffers);
@@ -563,7 +562,7 @@ class MTLDevice : public offloadtest::Device {
     CmdEncoder->setVertexBuffer(llvm::cast<MTLBuffer>(*IS.VB).Buf, 0, 0);
 
     CmdEncoder->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0),
-                               P.Bindings.getVertexCount());
+                               P.getVertexCount());
 
     CmdEncoder->endEncoding();
 

@@ -2572,20 +2572,22 @@ public:
     }
 
     if (P.isCompute()) {
-      const llvm::ArrayRef<int> DispatchSize =
-          llvm::ArrayRef<int>(P.Shaders[0].DispatchSize);
-      vkCmdDispatch(IS.CB->CmdBuffer, DispatchSize[0], DispatchSize[1],
-                    DispatchSize[2]);
-      llvm::outs() << "Dispatched compute shader: { " << DispatchSize[0] << ", "
-                   << DispatchSize[1] << ", " << DispatchSize[2] << " }\n";
+      vkCmdDispatch(IS.CB->CmdBuffer,
+                    P.DispatchParameters.DispatchGroupCount[0],
+                    P.DispatchParameters.DispatchGroupCount[1],
+                    P.DispatchParameters.DispatchGroupCount[2]);
+      llvm::outs() << "Dispatched compute shader: { "
+                   << P.DispatchParameters.DispatchGroupCount[0] << ", "
+                   << P.DispatchParameters.DispatchGroupCount[1] << ", "
+                   << P.DispatchParameters.DispatchGroupCount[2] << " }\n";
     } else {
       VkDeviceSize Offsets[1]{0};
       assert(IS.VB);
       VkBuffer VBHandle = llvm::cast<VulkanBuffer>(*IS.VB).Buffer;
       vkCmdBindVertexBuffers(IS.CB->CmdBuffer, 0, 1, &VBHandle, Offsets);
       // instanceCount must be >=1 to draw; previously was 0 which draws nothing
-      vkCmdDraw(IS.CB->CmdBuffer, P.Bindings.getVertexCount(), 1, 0, 0);
-      llvm::outs() << "Drew " << P.Bindings.getVertexCount() << " vertices.\n";
+      vkCmdDraw(IS.CB->CmdBuffer, P.getVertexCount(), 1, 0, 0);
+      llvm::outs() << "Drew " << P.getVertexCount() << " vertices.\n";
       vkCmdEndRenderPass(IS.CB->CmdBuffer);
       copyTextureToReadback(IS.CB->CmdBuffer,
                             llvm::cast<VulkanTexture>(*IS.RenderTarget),

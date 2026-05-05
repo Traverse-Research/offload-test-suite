@@ -1715,10 +1715,9 @@ public:
       }
     }
 
-    const llvm::ArrayRef<int> DispatchSize =
-        llvm::ArrayRef<int>(P.Shaders[0].DispatchSize);
-
-    IS.CB->CmdList->Dispatch(DispatchSize[0], DispatchSize[1], DispatchSize[2]);
+    IS.CB->CmdList->Dispatch(P.DispatchParameters.DispatchGroupCount[0],
+                             P.DispatchParameters.DispatchGroupCount[1],
+                             P.DispatchParameters.DispatchGroupCount[2]);
 
     auto CopyBackResource = [&IS, this](ResourcePair &R) {
       if (R.first->isTexture()) {
@@ -1952,7 +1951,7 @@ public:
                                 static_cast<LONG>(VP.Height)};
     IS.CB->CmdList->RSSetScissorRects(1, &Scissor);
 
-    IS.CB->CmdList->DrawInstanced(P.Bindings.getVertexCount(), 1, 0, 0);
+    IS.CB->CmdList->DrawInstanced(P.getVertexCount(), 1, 0, 0);
 
     // Transition the render target to copy source and copy to the readback
     // buffer.
