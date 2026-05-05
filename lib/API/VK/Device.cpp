@@ -831,6 +831,7 @@ private:
   PFN_vkDestroyAccelerationStructureKHR FnDestroyAS = nullptr;
   PFN_vkGetAccelerationStructureBuildSizesKHR FnGetASBuildSizes = nullptr;
   PFN_vkGetAccelerationStructureDeviceAddressKHR FnGetASDeviceAddress = nullptr;
+  PFN_vkCmdBuildAccelerationStructuresKHR FnCmdBuildAS = nullptr;
 
   struct BufferRef {
     VkBuffer Buffer;
@@ -909,6 +910,10 @@ private:
     llvm::SmallVector<VkDescriptorSet> DescriptorSets;
     llvm::SmallVector<VkBufferView> BufferViews;
     llvm::SmallVector<VkImageView> ImageViews;
+
+    // Built acceleration structures, kept alive for the pipeline lifetime.
+    llvm::SmallVector<std::unique_ptr<offloadtest::AccelerationStructure>>
+        AccelStructs;
   };
 
 public:
@@ -1079,6 +1084,10 @@ public:
           reinterpret_cast<PFN_vkGetAccelerationStructureDeviceAddressKHR>(
               vkGetDeviceProcAddr(
                   Device, "vkGetAccelerationStructureDeviceAddressKHR"));
+      Dev->FnCmdBuildAS =
+          reinterpret_cast<PFN_vkCmdBuildAccelerationStructuresKHR>(
+              vkGetDeviceProcAddr(Device,
+                                  "vkCmdBuildAccelerationStructuresKHR"));
     }
 
     return Dev;
@@ -2186,7 +2195,127 @@ public:
     return ResourceRef(Host, ImageRef{0, Sampler, 0});
   }
 
+  llvm::Error createAccelerationStructures(Pipeline &P, InvocationState &IS) {
+    if (P.AccelStructs.BLAS.empty() && P.AccelStructs.TLAS.empty())
+      return llvm::Error::success();
+
+    if (!HasRayTracingSupport)
+      return llvm::createStringError(
+          std::errc::not_supported,
+          "Pipeline defines acceleration structures but ray tracing is not "
+          "supported on this device.");
+
+    // Upload vertex/index data and build each BLAS.
+    llvm::StringMap<size_t> BLASIndex;
+    for (auto &BD : P.AccelStructs.BLAS) {
+      llvm::SmallVector<TriangleGeometryDesc> Triangles;
+      llvm::SmallVector<std::unique_ptr<offloadtest::Buffer>> GeomBuffers;
+
+      for (auto &T : BD.Triangles) {
+        assert(T.VertexBufferPtr && "VertexBufferPtr not resolved");
+        BufferCreateDesc BufDesc{MemoryLocation::CpuToGpu,
+                                 BufferUsage::Storage};
+        auto VBOrErr =
+            createBuffer("AS-Vertices", BufDesc, T.VertexBufferPtr->size());
+        if (!VBOrErr)
+          return VBOrErr.takeError();
+        auto &VB = *VBOrErr;
+        auto PtrOrErr = VB->map();
+        if (!PtrOrErr)
+          return PtrOrErr.takeError();
+        memcpy(*PtrOrErr, T.VertexBufferPtr->Data[0].get(),
+               T.VertexBufferPtr->size());
+        if (auto Err = VB->unmap())
+          return std::move(Err);
+
+        TriangleGeometryDesc Desc;
+        Desc.VertexBuffer = VB.get();
+        Desc.VertexCount = T.VertexCount;
+        Desc.VertexStride = T.VertexStride;
+        Desc.VertexFormat = T.VertexFormat;
+        Desc.Opaque = T.Opaque;
+
+        if (T.IndexBufferPtr) {
+          auto IBOrErr =
+              createBuffer("AS-Indices", BufDesc, T.IndexBufferPtr->size());
+          if (!IBOrErr)
+            return IBOrErr.takeError();
+          auto &IB = *IBOrErr;
+          auto IPtrOrErr = IB->map();
+          if (!IPtrOrErr)
+            return IPtrOrErr.takeError();
+          memcpy(*IPtrOrErr, T.IndexBufferPtr->Data[0].get(),
+                 T.IndexBufferPtr->size());
+          if (auto Err = IB->unmap())
+            return std::move(Err);
+          Desc.IndexBuffer = IB.get();
+          Desc.IndexCount = T.IndexCount;
+          Desc.IdxFormat = T.IdxFormat;
+          GeomBuffers.push_back(std::move(IB));
+        }
+
+        Triangles.push_back(Desc);
+        GeomBuffers.push_back(std::move(VB));
+      }
+
+      // TODO: AABB geometry support.
+
+      auto ReqOrErr = createBLASBuildRequest(Triangles, {}, BuildFlagNone);
+      if (!ReqOrErr)
+        return ReqOrErr.takeError();
+
+      auto ASOrErr = createAccelerationStructure(*ReqOrErr);
+      if (!ASOrErr)
+        return ASOrErr.takeError();
+
+      BLASIndex[BD.Name] = IS.AccelStructs.size();
+      IS.AccelStructs.push_back(std::move(*ASOrErr));
+      llvm::outs() << "Created BLAS '" << BD.Name << "'.\n";
+    }
+
+    // Build each TLAS referencing the BLASes.
+    for (auto &TD : P.AccelStructs.TLAS) {
+      llvm::SmallVector<AccelerationStructureInstance> Instances;
+      for (auto &Inst : TD.Instances) {
+        auto It = BLASIndex.find(Inst.BLAS);
+        if (It == BLASIndex.end())
+          return llvm::createStringError(
+              std::errc::invalid_argument,
+              "TLAS '%s' references unknown BLAS '%s'", TD.Name.c_str(),
+              Inst.BLAS.c_str());
+
+        AccelerationStructureInstance ASInst;
+        memcpy(ASInst.Transform, Inst.Transform, sizeof(ASInst.Transform));
+        ASInst.InstanceID = Inst.InstanceID;
+        ASInst.InstanceMask = Inst.InstanceMask;
+        ASInst.BLAS = IS.AccelStructs[It->second].get();
+        Instances.push_back(ASInst);
+      }
+
+      auto ReqOrErr = createTLASBuildRequest(Instances, BuildFlagNone);
+      if (!ReqOrErr)
+        return ReqOrErr.takeError();
+
+      auto ASOrErr = createAccelerationStructure(*ReqOrErr);
+      if (!ASOrErr)
+        return ASOrErr.takeError();
+
+      IS.AccelStructs.push_back(std::move(*ASOrErr));
+      llvm::outs() << "Created TLAS '" << TD.Name << "'.\n";
+    }
+
+    return llvm::Error::success();
+  }
+
   llvm::Error createResource(Resource &R, InvocationState &IS) {
+    // Acceleration structures are created separately; push a placeholder so
+    // the resource index stays in sync with the descriptor set layout.
+    if (R.isAccelerationStructure()) {
+      ResourceBundle Bundle{getDescriptorType(R.Kind), 0, nullptr};
+      IS.Resources.push_back(Bundle);
+      return llvm::Error::success();
+    }
+
     // Samplers don't have backing data buffers, so handle them separately
     if (R.isSampler()) {
       ResourceBundle Bundle{getDescriptorType(R.Kind), 0, nullptr};
@@ -2351,6 +2480,9 @@ public:
     uint32_t DescriptorCounts[DescriptorTypesSize] = {0};
     for (const auto &S : P.Sets) {
       for (const auto &R : S.Resources) {
+        // TODO: AS descriptors need a separate pool size entry.
+        if (R.isAccelerationStructure())
+          continue;
         DescriptorCounts[getDescriptorType(R.Kind)] += R.getArraySize();
         if (R.HasCounter)
           DescriptorCounts[VK_DESCRIPTOR_TYPE_STORAGE_BUFFER] +=
@@ -2413,6 +2545,9 @@ public:
     uint32_t BufferViewCount = 0;
     for (auto &D : P.Sets) {
       for (auto &R : D.Resources) {
+        // TODO: Count AS descriptors when binding is implemented.
+        if (R.isAccelerationStructure())
+          continue;
         if (R.isSampler()) {
           ImageInfoCount += 1;
           continue;
@@ -2448,6 +2583,9 @@ public:
       for (uint32_t RIdx = 0; RIdx < P.Sets[SetIdx].Resources.size();
            ++RIdx, ++OverallResIdx) {
         const Resource &R = P.Sets[SetIdx].Resources[RIdx];
+        // TODO: Write AS descriptors when binding is implemented.
+        if (R.isAccelerationStructure())
+          continue;
         uint32_t IndexOfFirstBufferDataInArray;
         if (R.isSampler()) {
           IndexOfFirstBufferDataInArray = ImageInfos.size();
@@ -3257,6 +3395,9 @@ public:
       return CBOrErr.takeError();
     State.CB = std::move(*CBOrErr);
     llvm::outs() << "Command buffer created.\n";
+
+    if (auto Err = createAccelerationStructures(P, State))
+      return Err;
 
     if (auto Err = createResources(P, State))
       return Err;
