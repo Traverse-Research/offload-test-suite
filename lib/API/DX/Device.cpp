@@ -1399,10 +1399,7 @@ public:
     // include UAV counter space or CBV alignment padding).
     const size_t UploadSize = BR.getSizeInBytes();
 
-    BufferCreateDesc UploadDesc = {};
-    UploadDesc.Location = MemoryLocation::CpuToGpu;
-    UploadDesc.Backing = MemoryBacking::Automatic;
-    UploadDesc.Usage = BufferUsage::Storage;
+    BufferCreateDesc UploadDesc = BufferCreateDesc::uploadBuffer();
     auto UploadOrErr = createBuffer("Upload", UploadDesc, UploadSize);
     if (!UploadOrErr)
       return UploadOrErr.takeError();

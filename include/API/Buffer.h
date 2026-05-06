@@ -33,6 +33,14 @@ struct BufferCreateDesc {
   MemoryBacking Backing;
   BufferUsage Usage;
   bool HasCounter;
+
+  static BufferCreateDesc uploadBuffer() {
+    BufferCreateDesc Desc = {};
+    Desc.Location = MemoryLocation::CpuToGpu;
+    Desc.Backing = MemoryBacking::Automatic;
+    Desc.Usage = BufferUsage::Storage;
+    return Desc;
+  }
 };
 
 class Buffer {
