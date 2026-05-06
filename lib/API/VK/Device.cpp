@@ -419,10 +419,7 @@ public:
     return Ptr;
   }
 
-  llvm::Error unmap() override {
-    vkUnmapMemory(Dev, Memory);
-    return llvm::Error::success();
-  }
+  void unmap() override { vkUnmapMemory(Dev, Memory); }
 
   ~VulkanBuffer() override {
     vkDestroyBuffer(Dev, Buffer, nullptr);
@@ -1435,7 +1432,7 @@ public:
   }
 
   llvm::Expected<std::unique_ptr<offloadtest::Buffer>>
-  createBuffer(std::string Name, BufferCreateDesc &Desc,
+  createBuffer(std::string Name, const BufferCreateDesc &Desc,
                size_t SizeInBytes) override {
     VkBufferCreateInfo BufInfo = {};
     BufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;

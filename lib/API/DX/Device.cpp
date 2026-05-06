@@ -328,10 +328,7 @@ public:
     return Ptr;
   }
 
-  llvm::Error unmap() override {
-    Buffer->Unmap(0, nullptr);
-    return llvm::Error::success();
-  }
+  void unmap() override { Buffer->Unmap(0, nullptr); }
 
   static bool classof(const offloadtest::Buffer *B) {
     return B->getAPI() == GPUAPI::DirectX;
@@ -972,7 +969,7 @@ public:
   }
 
   llvm::Expected<std::unique_ptr<offloadtest::Buffer>>
-  createBuffer(std::string Name, BufferCreateDesc &Desc,
+  createBuffer(std::string Name, const BufferCreateDesc &Desc,
                size_t SizeInBytes) override {
     const D3D12_HEAP_TYPE HeapType = getDXHeapType(Desc.Location);
 

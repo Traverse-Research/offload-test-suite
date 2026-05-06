@@ -109,8 +109,7 @@ offloadtest::createVertexBufferFromCPUBuffer(Device &Dev,
   if (!PtrOrErr)
     return PtrOrErr.takeError();
   memcpy(*PtrOrErr, Buf.Data[0].get(), Buf.size());
-  if (auto Err = VB->unmap())
-    return std::move(Err);
+  VB->unmap();
 
   return VB;
 }
@@ -129,4 +128,50 @@ offloadtest::createDefaultDepthStencilTarget(Device &Dev, uint32_t Width,
   Desc.OptimizedClearValue = ClearDepthStencil{1.0f, 0};
 
   return Dev.createTexture("DepthStencil", Desc);
+}
+
+llvm::Expected<std::unique_ptr<offloadtest::Buffer>>
+createBufferWithData(Device &Dev, std::string Name, BufferCreateDesc &Desc,
+                     const void *Data, size_t SizeInBytes,
+                     CommandEncoder *Encoder) {
+  auto BufferOrErr = Dev.createBuffer(Name, Desc, SizeInBytes);
+  if (!BufferOrErr)
+    return BufferOrErr.takeError();
+  auto Buffer = std::move(*BufferOrErr);
+
+  if (Desc.Location == MemoryLocation::GpuOnly) {
+    // TODO(manon): how will we keep the upload buffer alive?
+    assert(
+        false &&
+        "UploadBuffers can't be kept alive yet. Code path not yet supported.");
+
+    // Create Upload buffer
+    const BufferCreateDesc UploadDesc = BufferCreateDesc::uploadBuffer();
+    auto UploadBufferOrErr = Dev.createBuffer(Name, UploadDesc, SizeInBytes);
+    if (!UploadBufferOrErr)
+      return UploadBufferOrErr.takeError();
+    auto UploadBuffer = std::move(*UploadBufferOrErr);
+
+    // Copy data over
+    auto MappedPtrOrErr = UploadBuffer->map();
+    if (!MappedPtrOrErr)
+      return MappedPtrOrErr.takeError();
+    void *MappedPtr = *MappedPtrOrErr;
+    memcpy(MappedPtr, Data, SizeInBytes);
+    UploadBuffer->unmap();
+
+    // Copy Buffer to Buffer
+    // NOTE(manon): If we can keep buffers alive here, that'd be great.
+    Encoder->copyBufferToBuffer(*UploadBuffer, 0, *Buffer, 0, SizeInBytes);
+  } else {
+    // Copy data over
+    auto MappedPtrOrErr = Buffer->map();
+    if (!MappedPtrOrErr)
+      return MappedPtrOrErr.takeError();
+    void *MappedPtr = *MappedPtrOrErr;
+    memcpy(MappedPtr, Data, SizeInBytes);
+    Buffer->unmap();
+  }
+
+  return Buffer;
 }

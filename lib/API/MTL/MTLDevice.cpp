@@ -168,13 +168,12 @@ public:
     return Buf->contents();
   }
 
-  llvm::Error unmap() override {
+  void unmap() override {
     // Managed storage (CpuToGpu) requires an explicit didModifyRange to
     // propagate CPU-side writes to the GPU. Shared storage (GpuToCpu) is
     // coherent and needs no action.
     if (Desc.Location == MemoryLocation::CpuToGpu)
       Buf->didModifyRange(NS::Range::Make(0, SizeInBytes));
-    return llvm::Error::success();
   }
 
   ~MTLBuffer() override {
@@ -815,7 +814,7 @@ public:
   }
 
   llvm::Expected<std::unique_ptr<offloadtest::Buffer>>
-  createBuffer(std::string Name, BufferCreateDesc &Desc,
+  createBuffer(std::string Name, cosnt BufferCreateDesc &Desc,
                size_t SizeInBytes) override {
     MTL::Buffer *Buf = Device->newBuffer(
         SizeInBytes, getMetalBufferResourceOptions(Desc.Location));
