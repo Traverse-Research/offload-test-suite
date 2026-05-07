@@ -131,9 +131,9 @@ offloadtest::createDefaultDepthStencilTarget(Device &Dev, uint32_t Width,
 }
 
 llvm::Expected<std::unique_ptr<offloadtest::Buffer>>
-createBufferWithData(Device &Dev, std::string Name, BufferCreateDesc &Desc,
-                     const void *Data, size_t SizeInBytes,
-                     CommandEncoder *Encoder) {
+createBufferWithData(Device &Dev, std::string Name,
+                     const BufferCreateDesc &Desc, const void *Data,
+                     size_t SizeInBytes, CommandEncoder *Encoder) {
   auto BufferOrErr = Dev.createBuffer(Name, Desc, SizeInBytes);
   if (!BufferOrErr)
     return BufferOrErr.takeError();
@@ -147,21 +147,15 @@ createBufferWithData(Device &Dev, std::string Name, BufferCreateDesc &Desc,
 
     // Create Upload buffer
     const BufferCreateDesc UploadDesc = BufferCreateDesc::uploadBuffer();
-    auto UploadBufferOrErr = Dev.createBuffer(Name, UploadDesc, SizeInBytes);
+    std::string UploadBufferName = Name + " (Upload Buffer)";
+    auto UploadBufferOrErr = createBufferWithData(
+        Dev, UploadBufferName, UploadDesc, Data, SizeInBytes, Encoder);
     if (!UploadBufferOrErr)
       return UploadBufferOrErr.takeError();
     auto UploadBuffer = std::move(*UploadBufferOrErr);
 
-    // Copy data over
-    auto MappedPtrOrErr = UploadBuffer->map();
-    if (!MappedPtrOrErr)
-      return MappedPtrOrErr.takeError();
-    void *MappedPtr = *MappedPtrOrErr;
-    memcpy(MappedPtr, Data, SizeInBytes);
-    UploadBuffer->unmap();
-
     // Copy Buffer to Buffer
-    // NOTE(manon): If we can keep buffers alive here, that'd be great.
+    // NOTE(manon): If we can keep buffers alive here, we have nothing to worry about
     Encoder->copyBufferToBuffer(*UploadBuffer, 0, *Buffer, 0, SizeInBytes);
   } else {
     // Copy data over
