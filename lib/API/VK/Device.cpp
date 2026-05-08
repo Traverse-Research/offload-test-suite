@@ -2415,11 +2415,15 @@ public:
     constexpr size_t DescriptorTypesSize =
         sizeof(DescriptorTypes) / sizeof(VkDescriptorType);
     uint32_t DescriptorCounts[DescriptorTypesSize] = {0};
+    // VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR has an out-of-range enum
+    // value (1000150000), so it can't share the indexed array above.
+    uint32_t ASDescriptorCount = 0;
     for (const auto &S : P.Sets) {
       for (const auto &R : S.Resources) {
-        // TODO: AS descriptors need a separate pool size entry.
-        if (R.isAccelerationStructure())
+        if (R.isAccelerationStructure()) {
+          ASDescriptorCount += R.getArraySize();
           continue;
+        }
         DescriptorCounts[getDescriptorType(R.Kind)] += R.getArraySize();
         if (R.HasCounter)
           DescriptorCounts[VK_DESCRIPTOR_TYPE_STORAGE_BUFFER] +=
@@ -2436,6 +2440,12 @@ public:
         PoolSize.descriptorCount = DescriptorCounts[Type];
         PoolSizes.push_back(PoolSize);
       }
+    }
+    if (ASDescriptorCount > 0) {
+      llvm::outs() << "Descriptors: { type = ACCELERATION_STRUCTURE_KHR"
+                   << ", count = " << ASDescriptorCount << " }\n";
+      PoolSizes.push_back({VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR,
+                           ASDescriptorCount});
     }
 
     if (P.Sets.size() > 0) {
@@ -2480,11 +2490,15 @@ public:
     uint32_t ImageInfoCount = 0;
     uint32_t BufferInfoCount = 0;
     uint32_t BufferViewCount = 0;
+    uint32_t ASInfoCount = 0;
+    uint32_t ASHandleCount = 0;
     for (auto &D : P.Sets) {
       for (auto &R : D.Resources) {
-        // TODO: Count AS descriptors when binding is implemented.
-        if (R.isAccelerationStructure())
+        if (R.isAccelerationStructure()) {
+          ASInfoCount += 1;
+          ASHandleCount += R.getArraySize();
           continue;
+        }
         if (R.isSampler()) {
           ImageInfoCount += 1;
           continue;
@@ -2506,13 +2520,17 @@ public:
     llvm::SmallVector<VkDescriptorImageInfo> ImageInfos;
     llvm::SmallVector<VkDescriptorBufferInfo> BufferInfos;
     llvm::SmallVector<VkBufferView> BufferViews;
+    llvm::SmallVector<VkWriteDescriptorSetAccelerationStructureKHR> ASInfos;
+    llvm::SmallVector<VkAccelerationStructureKHR> ASHandles;
     ImageInfos.reserve(ImageInfoCount);
     BufferInfos.reserve(BufferInfoCount);
     BufferViews.reserve(BufferViewCount);
+    ASInfos.reserve(ASInfoCount);
+    ASHandles.reserve(ASHandleCount);
 
     llvm::SmallVector<VkWriteDescriptorSet> WriteDescriptors;
     WriteDescriptors.reserve(ImageInfoCount + BufferInfoCount +
-                             BufferViewCount);
+                             BufferViewCount + ASInfoCount);
     assert(IS.BufferViews.empty());
 
     uint32_t OverallResIdx = 0;
@@ -2520,9 +2538,36 @@ public:
       for (uint32_t RIdx = 0; RIdx < P.Sets[SetIdx].Resources.size();
            ++RIdx, ++OverallResIdx) {
         const Resource &R = P.Sets[SetIdx].Resources[RIdx];
-        // TODO: Write AS descriptors when binding is implemented.
-        if (R.isAccelerationStructure())
+        if (R.isAccelerationStructure()) {
+          assert(R.TLASPtr && "AS resource must be resolved to a TLAS");
+          assert(R.getArraySize() == 1 && "AS arrays not yet supported");
+          // OutAS layout from buildPipelineAccelerationStructures: BLASes
+          // first, then TLASes — both in P.AccelStructs declaration order.
+          const size_t TLASIdx = R.TLASPtr - &P.AccelStructs.TLAS[0];
+          const size_t ASIdx = P.AccelStructs.BLAS.size() + TLASIdx;
+          auto *VkAS = llvm::cast<VulkanAccelerationStructure>(
+              IS.AccelStructs[ASIdx].get());
+          const size_t HandleStart = ASHandles.size();
+          ASHandles.push_back(VkAS->AccelStruct);
+          VkWriteDescriptorSetAccelerationStructureKHR ASWrite = {};
+          ASWrite.sType =
+              VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
+          ASWrite.accelerationStructureCount = 1;
+          ASWrite.pAccelerationStructures = &ASHandles[HandleStart];
+          ASInfos.push_back(ASWrite);
+
+          VkWriteDescriptorSet WDS = {};
+          WDS.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+          WDS.pNext = &ASInfos.back();
+          WDS.dstSet = IS.DescriptorSets[SetIdx];
+          WDS.dstBinding = R.VKBinding->Binding;
+          WDS.descriptorCount = 1;
+          WDS.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+          llvm::outs() << "Updating AS Descriptor [" << OverallResIdx << "] { "
+                       << SetIdx << ", " << RIdx << " }\n";
+          WriteDescriptors.push_back(WDS);
           continue;
+        }
         uint32_t IndexOfFirstBufferDataInArray;
         if (R.isSampler()) {
           IndexOfFirstBufferDataInArray = ImageInfos.size();

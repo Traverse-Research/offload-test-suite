@@ -17,6 +17,7 @@
 #define IR_PRIVATE_IMPLEMENTATION
 #include "metal_irconverter.h"
 #include "metal_irconverter_runtime.h"
+#include "ir_raytracing.h"
 
 #include "API/Device.h"
 #include "API/Encoder.h"
@@ -1014,10 +1015,19 @@ class MTLDevice : public offloadtest::Device {
     uint32_t HeapIndex = 0;
     for (auto &T : IS.DescTables) {
       for (auto &R : T.Resources) {
-        // AS descriptor binding lands in the AS-bind commit; this loop runs
-        // its dedicated path then continues. Advance HeapIndex so subsequent
-        // resources land in the slots the shader's argument buffer expects.
         if (R.first->isAccelerationStructure()) {
+          assert(R.first->TLASPtr && "AS resource must be resolved to a TLAS");
+          assert(R.first->getArraySize() == 1 &&
+                 "AS arrays not yet supported");
+          // OutAS layout from buildPipelineAccelerationStructures:
+          // BLASes first, then TLASes — both in declaration order.
+          const size_t TLASIdx = R.first->TLASPtr - &P.AccelStructs.TLAS[0];
+          const size_t ASIdx = P.AccelStructs.BLAS.size() + TLASIdx;
+          auto *MTLAS =
+              llvm::cast<MTLAccelStruct>(IS.AccelStructs[ASIdx].get());
+          IRDescriptorTableSetAccelerationStructure(
+              IS.DescHeap->getEntryHandle(HeapIndex),
+              MTLAS->AccelStruct->gpuResourceID()._impl);
           HeapIndex += R.first->getArraySize();
           continue;
         }
@@ -1075,6 +1085,10 @@ class MTLDevice : public offloadtest::Device {
           NativeEncoder->useResource(ResSet.Resource.get(),
                                      MTL::ResourceUsageRead |
                                          MTL::ResourceUsageWrite);
+    for (auto &AS : IS.AccelStructs) {
+      auto *MTLAS = llvm::cast<MTLAccelStruct>(AS.get());
+      NativeEncoder->useResource(MTLAS->AccelStruct, MTL::ResourceUsageRead);
+    }
 
     NS::UInteger TGS[3] = {PS->ComputePipeline->maxTotalThreadsPerThreadgroup(),
                            1, 1};

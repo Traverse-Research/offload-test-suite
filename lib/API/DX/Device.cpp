@@ -1838,12 +1838,34 @@ public:
 
     // Bind descriptors in descriptor tables.
     uint32_t HeapIndex = 0;
+    const uint32_t DescIncSize = Device->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     for (auto &T : IS.DescTables) {
       for (auto &R : T.Resources) {
-        // AS descriptor binding lands in the AS-bind commit; this loop runs
-        // its dedicated path then continues. Advance HeapIndex so subsequent
-        // resources land in the slots the shader's root signature expects.
         if (R.first->isAccelerationStructure()) {
+          assert(R.first->TLASPtr && "AS resource must be resolved to a TLAS");
+          assert(R.first->getArraySize() == 1 &&
+                 "AS arrays not yet supported");
+          // OutAS layout from buildPipelineAccelerationStructures: BLASes
+          // first, then TLASes — both in P.AccelStructs declaration order.
+          const size_t TLASIdx = R.first->TLASPtr - &P.AccelStructs.TLAS[0];
+          const size_t ASIdx = P.AccelStructs.BLAS.size() + TLASIdx;
+          auto *DXAS = llvm::cast<DXAccelerationStructure>(
+              IS.AccelStructs[ASIdx].get());
+          D3D12_SHADER_RESOURCE_VIEW_DESC SRVDesc = {};
+          SRVDesc.Format = DXGI_FORMAT_UNKNOWN;
+          SRVDesc.ViewDimension =
+              D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
+          SRVDesc.Shader4ComponentMapping =
+              D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+          SRVDesc.RaytracingAccelerationStructure.Location =
+              DXAS->getGPUVirtualAddress();
+          D3D12_CPU_DESCRIPTOR_HANDLE Handle =
+              IS.DescHeap->GetCPUDescriptorHandleForHeapStart();
+          Handle.ptr += HeapIndex * DescIncSize;
+          // AS SRVs are created with a null resource; the AS lives in the
+          // buffer referenced by Location.
+          Device->CreateShaderResourceView(nullptr, &SRVDesc, Handle);
           HeapIndex += R.first->getArraySize();
           continue;
         }
