@@ -1143,9 +1143,9 @@ class MTLDevice : public offloadtest::Device {
     CmdEncoder->setFrontFacingWinding(MTL::WindingCounterClockwise);
 
     if (IS.VB)
-      // Bind vertex buffer at slot 0 to match the vertex descriptor which
-      // references buffer index 0.
-      CmdEncoder->setVertexBuffer(llvm::cast<MTLBuffer>(*IS.VB).Buf, 0, 0);
+      // Match the buffer index used in the vertex descriptor.
+      CmdEncoder->setVertexBuffer(llvm::cast<MTLBuffer>(*IS.VB).Buf, 0,
+                                  kIRVertexBufferBindPoint);
 
     CmdEncoder->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0),
                                P.getVertexCount());
@@ -1410,7 +1410,7 @@ public:
         const uint32_t ElemSize = getFormatSizeInBytes(Elem.Fmt);
         MTL::VertexAttributeDescriptor *AttrDesc =
             MTL::VertexAttributeDescriptor::alloc()->init();
-        AttrDesc->setBufferIndex(0);
+        AttrDesc->setBufferIndex(kIRVertexBufferBindPoint);
         AttrDesc->setOffset(Elem.OffsetInBytes);
         AttrDesc->setFormat(getMetalVertexFormat(Elem.Fmt));
         VtxDesc->attributes()->setObject(AttrDesc, ShaderAttrIndices[AttrName]);
@@ -1423,7 +1423,7 @@ public:
       LDesc->setStride(Stride);
       LDesc->setStepRate(1);
       LDesc->setStepFunction(MTL::VertexStepFunctionPerVertex);
-      VtxDesc->layouts()->setObject(LDesc, 0);
+      VtxDesc->layouts()->setObject(LDesc, kIRVertexBufferBindPoint);
       LDesc->release();
 
       Desc->setVertexDescriptor(VtxDesc);
