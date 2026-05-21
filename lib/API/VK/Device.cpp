@@ -1444,9 +1444,9 @@ public:
           "Graphics pipeline requires a pixel shader on this backend.");
     const ShaderContainer &VS = Desc.VS;
     const ShaderContainer &PS = *Desc.PS;
-    const llvm::ArrayRef<InputLayoutDesc> InputLayout = Desc.InputLayout;
-    const llvm::ArrayRef<Format> RTFormats = Desc.RTFormats;
-    const std::optional<Format> DSFormat = Desc.DSFormat;
+    const llvm::ArrayRef<InputLayoutDesc> InputLayout = Desc.Metadata.InputLayout;
+    const llvm::ArrayRef<Format> RTFormats = Desc.Metadata.RTFormats;
+    const std::optional<Format> DSFormat = Desc.Metadata.DSFormat;
 
     VkShaderStageFlags GraphicsFlags = VK_SHADER_STAGE_VERTEX_BIT;
     llvm::SmallVector<VkPipelineShaderStageCreateInfo, 5> ShaderStages;
@@ -1579,7 +1579,7 @@ public:
     VkPipelineInputAssemblyStateCreateInfo InputAssemblyCI = {};
     InputAssemblyCI.sType =
         VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    InputAssemblyCI.topology = getVkPrimitiveTopology(Desc.Topology);
+    InputAssemblyCI.topology = getVkPrimitiveTopology(Desc.Metadata.Topology);
 
     VkPipelineViewportStateCreateInfo ViewportCI = {};
     ViewportCI.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
@@ -1651,8 +1651,10 @@ public:
       return Err;
     }
 
-    return std::make_unique<VulkanPipelineState>(
+    auto State = std::make_unique<VulkanPipelineState>(
         Name, Device, Pipeline, PipelineLayout, std::move(SetLayouts));
+    State->Meta = Desc.Metadata;
+    return State;
   }
 
   llvm::Expected<std::unique_ptr<offloadtest::Fence>>
@@ -2966,7 +2968,7 @@ public:
 
       if (IS.VB)
         Encoder.setVertexBuffer(0, IS.VB.get(), 0,
-                                P.Bindings.getVertexStride());
+                                IS.Pipeline->Meta->getVertexStride());
 
       if (auto Err =
               Encoder.drawInstanced(*IS.Pipeline.get(), P.getVertexCount(),
@@ -3170,53 +3172,25 @@ public:
       State.Pipeline = std::move(*PipelineStateOrErr);
       llvm::outs() << "Compute Pipeline created.\n";
     } else if (P.isTraditionalRaster()) {
-      GraphicsPipelineCreateDesc PipelineDesc = {};
-      PipelineDesc.Topology = P.Bindings.Topology;
-      PipelineDesc.DSFormat = Format::D32FloatS8Uint;
-      for (auto &Shader : P.Shaders) {
-        ShaderContainer SC = {};
-        SC.EntryPoint = Shader.Entry;
-        SC.Shader = Shader.Shader.get();
-        SC.SpecializationConstants = Shader.SpecializationConstants;
-        if (Shader.Stage == Stages::Vertex)
-          PipelineDesc.VS = std::move(SC);
-        else if (Shader.Stage == Stages::Pixel)
-          PipelineDesc.PS = std::move(SC);
-      }
-
-      // Create the input layout based on the vertex attributes.
-      for (auto &Attr : P.Bindings.VertexAttributes) {
-        auto FormatOrErr = toFormat(Attr.Format, Attr.Channels);
-        if (!FormatOrErr)
-          return FormatOrErr.takeError();
-
-        InputLayoutDesc Layout = {};
-        Layout.Name = Attr.Name;
-        Layout.Fmt = *FormatOrErr;
-        Layout.OffsetInBytes = Attr.Offset;
-        PipelineDesc.InputLayout.push_back(Layout);
-      }
-
-      auto FormatOrErr = toFormat(P.Bindings.RTargetBufferPtr->Format,
-                                  P.Bindings.RTargetBufferPtr->Channels);
-      if (!FormatOrErr)
-        return FormatOrErr.takeError();
-      PipelineDesc.RTFormats.push_back(*FormatOrErr);
+      auto PipelineDescOrErr = buildGraphicsPipelineCreateDesc(P);
+      if (!PipelineDescOrErr)
+        return PipelineDescOrErr.takeError();
 
       auto PipelineStateOrErr = createGraphicsPipeline(
-          "Graphics Pipeline State", BindingsDesc, PipelineDesc);
+          "Graphics Pipeline State", BindingsDesc, *PipelineDescOrErr);
       if (!PipelineStateOrErr)
         return PipelineStateOrErr.takeError();
       State.Pipeline = std::move(*PipelineStateOrErr);
       llvm::outs() << "Graphics Pipeline created.\n";
 
+      const GraphicsPipelineMetadata &Meta = *State.Pipeline->Meta;
       ColorAttachmentFormatDesc ColorAttachment = {};
-      ColorAttachment.Fmt = State.RenderTarget->getDesc().Fmt;
+      ColorAttachment.Fmt = Meta.RTFormats[0];
       ColorAttachment.Load = LoadAction::Clear;
       ColorAttachment.Store = StoreAction::Store;
 
       DepthStencilAttachmentFormatDesc DSAttachment = {};
-      DSAttachment.Fmt = State.DepthStencil->getDesc().Fmt;
+      DSAttachment.Fmt = *Meta.DSFormat;
       DSAttachment.DepthLoad = LoadAction::Clear;
       DSAttachment.DepthStore = StoreAction::Store;
       DSAttachment.StencilLoad = LoadAction::DontCare;

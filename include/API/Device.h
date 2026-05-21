@@ -81,11 +81,27 @@ struct ShaderContainer {
   llvm::SmallVector<SpecializationConstant> SpecializationConstants;
 };
 
-struct GraphicsPipelineCreateDesc {
+// Persistent description of a graphics pipeline's fixed-function state and I/O
+// layout.
+struct GraphicsPipelineMetadata {
   llvm::SmallVector<InputLayoutDesc> InputLayout;
   llvm::SmallVector<Format> RTFormats;
   std::optional<Format> DSFormat;
   PrimitiveTopology Topology;
+
+  // Byte stride spanning every attribute in InputLayout — large enough to hold
+  // the highest-offset element plus its size. Falls through gaps unchanged.
+  uint32_t getVertexStride() const {
+    uint32_t Stride = 0;
+    for (const InputLayoutDesc &Elem : InputLayout)
+      Stride =
+          std::max(Stride, Elem.OffsetInBytes + getFormatSizeInBytes(Elem.Fmt));
+    return Stride;
+  }
+};
+
+struct GraphicsPipelineCreateDesc {
+  GraphicsPipelineMetadata Metadata;
   ShaderContainer VS;
   // TODO: Optional Hull, Domain & Geometry Shaders
   std::optional<ShaderContainer> PS;
@@ -94,6 +110,10 @@ struct GraphicsPipelineCreateDesc {
 class PipelineState {
 public:
   GPUAPI API;
+  // Populated by graphics pipelines, empty for compute. Carries the persistent
+  // I/O state (input layout, RT/DS formats, topology) so the draw site can
+  // read it without reaching back into the test Pipeline.
+  std::optional<GraphicsPipelineMetadata> Meta;
 
   virtual ~PipelineState() = default;
 
@@ -208,6 +228,13 @@ initializeMetalDevices(const DeviceConfig Config,
                        llvm::SmallVectorImpl<std::unique_ptr<Device>> &Devices);
 llvm::Expected<llvm::SmallVector<std::unique_ptr<Device>>>
 initializeDevices(const DeviceConfig Config);
+
+// Builds a GraphicsPipelineCreateDesc from a test Pipeline: copies VS/PS shader
+// containers, derives the input layout from the vertex attributes, and pulls
+// topology / RT format from the pipeline bindings. Fails if a vertex attribute
+// or the render target uses an unsupported DataFormat.
+llvm::Expected<GraphicsPipelineCreateDesc>
+buildGraphicsPipelineCreateDesc(const Pipeline &P);
 
 // Creates a render target texture using the format and dimensions from a
 // CPUBuffer. Does not upload the buffer's data — only uses its description to

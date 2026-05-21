@@ -139,6 +139,16 @@ static IRShaderStage getShaderStage(Stages Stage) {
   llvm_unreachable("All cases handled");
 }
 
+static MTL::PrimitiveType getMTLPrimitiveType(PrimitiveTopology Topology) {
+  switch (Topology) {
+  case PrimitiveTopology::TriangleList:
+    return MTL::PrimitiveTypeTriangle;
+  case PrimitiveTopology::PointList:
+    return MTL::PrimitiveTypePoint;
+  }
+  llvm_unreachable("All PrimitiveTopology cases handled");
+}
+
 namespace {
 struct MTLDeleter {
   template <typename T> void operator()(T *Arg) const {
@@ -670,7 +680,7 @@ public:
                                      "Scissor must be set before drawing.");
 
     const auto &MTLPSO = llvm::cast<MTLPipelineState>(PSO);
-    if (!MTLPSO.RenderPipeline)
+    if (!MTLPSO.RenderPipeline || !MTLPSO.Meta)
       return llvm::createStringError(
           std::errc::invalid_argument,
           "PipelineState bound to drawInstanced() is not a render pipeline.");
@@ -681,7 +691,8 @@ public:
 
     // IRRuntimeDrawPrimitives also sets the DrawParams / DrawInfo argument
     // buffers that metal-irconverter consults for SV_VertexID and friends.
-    IRRuntimeDrawPrimitives(RenderEnc, MTL::PrimitiveTypeTriangle,
+    IRRuntimeDrawPrimitives(RenderEnc,
+                            getMTLPrimitiveType(MTLPSO.Meta->Topology),
                             static_cast<NS::UInteger>(FirstVertex),
                             static_cast<NS::UInteger>(VertexCount),
                             static_cast<NS::UInteger>(InstanceCount),
@@ -1382,7 +1393,8 @@ class MTLDevice : public offloadtest::Device {
     Encoder.setScissor(Scissor);
 
     if (IS.VB)
-      Encoder.setVertexBuffer(0, IS.VB.get(), 0, P.Bindings.getVertexStride());
+      Encoder.setVertexBuffer(0, IS.VB.get(), 0,
+                              IS.Pipeline->Meta->getVertexStride());
 
     if (auto Err = Encoder.drawInstanced(*IS.Pipeline.get(), P.getVertexCount(),
                                          /*InstanceCount=*/1))
@@ -1552,15 +1564,15 @@ public:
       return llvm::createStringError(
           std::errc::invalid_argument,
           "Graphics pipeline requires a pixel shader on this backend.");
-    if (Desc.Topology != PrimitiveTopology::TriangleList)
+    if (Desc.Metadata.Topology != PrimitiveTopology::TriangleList)
       return llvm::createStringError(
           std::errc::not_supported,
           "Metal: Only TriangleList topology is currently supported.");
     const ShaderContainer &VS = Desc.VS;
     const ShaderContainer &PS = *Desc.PS;
-    const llvm::ArrayRef<InputLayoutDesc> InputLayout = Desc.InputLayout;
-    const llvm::ArrayRef<Format> RTFormats = Desc.RTFormats;
-    const std::optional<Format> DSFormat = Desc.DSFormat;
+    const llvm::ArrayRef<InputLayoutDesc> InputLayout = Desc.Metadata.InputLayout;
+    const llvm::ArrayRef<Format> RTFormats = Desc.Metadata.RTFormats;
+    const std::optional<Format> DSFormat = Desc.Metadata.DSFormat;
 
     IRRootSignaturePtr RootSig;
     std::unique_ptr<MTLTopLevelArgumentBuffer> ArgBuffer;
@@ -1713,9 +1725,11 @@ public:
     MTL::DepthStencilState *DSState = Device->newDepthStencilState(DSDesc);
     DSDesc->release();
 
-    return std::make_unique<MTLPipelineState>(Name, std::move(RootSig),
-                                              std::move(ArgBuffer), PSO,
-                                              DSState, MTL::CullModeNone);
+    auto State = std::make_unique<MTLPipelineState>(
+        Name, std::move(RootSig), std::move(ArgBuffer), PSO, DSState,
+        MTL::CullModeNone);
+    State->Meta = Desc.Metadata;
+    return State;
   }
 
   llvm::Error executeProgram(Pipeline &P) override {
@@ -1767,50 +1781,24 @@ public:
       if (auto Err = createComputeCommands(P, IS))
         return Err;
     } else {
-      GraphicsPipelineCreateDesc PipelineDesc = {};
-      PipelineDesc.Topology = P.Bindings.Topology;
-      PipelineDesc.DSFormat = Format::D32FloatS8Uint;
-      for (auto &Shader : P.Shaders) {
-        ShaderContainer SC = {};
-        SC.EntryPoint = Shader.Entry;
-        SC.Shader = Shader.Shader.get();
-        if (Shader.Stage == Stages::Vertex)
-          PipelineDesc.VS = std::move(SC);
-        else if (Shader.Stage == Stages::Pixel)
-          PipelineDesc.PS = std::move(SC);
-      }
-
-      for (auto &Attr : P.Bindings.VertexAttributes) {
-        auto FormatOrErr = toFormat(Attr.Format, Attr.Channels);
-        if (!FormatOrErr)
-          return FormatOrErr.takeError();
-
-        InputLayoutDesc Layout = {};
-        Layout.Name = Attr.Name;
-        Layout.Fmt = *FormatOrErr;
-        Layout.OffsetInBytes = Attr.Offset;
-        PipelineDesc.InputLayout.push_back(Layout);
-      }
-
-      auto FormatOrErr = toFormat(P.Bindings.RTargetBufferPtr->Format,
-                                  P.Bindings.RTargetBufferPtr->Channels);
-      if (!FormatOrErr)
-        return FormatOrErr.takeError();
-      PipelineDesc.RTFormats.push_back(*FormatOrErr);
+      auto PipelineDescOrErr = buildGraphicsPipelineCreateDesc(P);
+      if (!PipelineDescOrErr)
+        return PipelineDescOrErr.takeError();
 
       auto PipelineStateOrErr = createGraphicsPipeline(
-          "Graphics Pipeline State", Bindings, PipelineDesc);
+          "Graphics Pipeline State", Bindings, *PipelineDescOrErr);
       if (!PipelineStateOrErr)
         return PipelineStateOrErr.takeError();
       IS.Pipeline = std::move(*PipelineStateOrErr);
 
+      const GraphicsPipelineMetadata &Meta = *IS.Pipeline->Meta;
       ColorAttachmentFormatDesc ColorAttachment = {};
-      ColorAttachment.Fmt = *FormatOrErr;
+      ColorAttachment.Fmt = Meta.RTFormats[0];
       ColorAttachment.Load = LoadAction::Clear;
       ColorAttachment.Store = StoreAction::Store;
 
       DepthStencilAttachmentFormatDesc DSAttachment = {};
-      DSAttachment.Fmt = Format::D32FloatS8Uint;
+      DSAttachment.Fmt = *Meta.DSFormat;
       DSAttachment.DepthLoad = LoadAction::Clear;
       DSAttachment.DepthStore = StoreAction::Store;
       DSAttachment.StencilLoad = LoadAction::DontCare;

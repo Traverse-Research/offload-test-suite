@@ -70,6 +70,49 @@ offloadtest::initializeDevices(const DeviceConfig Config) {
   return Devices;
 }
 
+llvm::Expected<GraphicsPipelineCreateDesc>
+offloadtest::buildGraphicsPipelineCreateDesc(const Pipeline &P) {
+  GraphicsPipelineCreateDesc Desc = {};
+  Desc.Metadata.Topology = P.Bindings.Topology;
+  // TODO: depth/stencil format is currently hardcoded; lift this into the
+  // pipeline definition once tests need to vary it.
+  Desc.Metadata.DSFormat = Format::D32FloatS8Uint;
+
+  for (const auto &Shader : P.Shaders) {
+    ShaderContainer SC = {};
+    SC.EntryPoint = Shader.Entry;
+    SC.Shader = Shader.Shader.get();
+    SC.SpecializationConstants = Shader.SpecializationConstants;
+    if (Shader.Stage == Stages::Vertex)
+      Desc.VS = std::move(SC);
+    else if (Shader.Stage == Stages::Pixel)
+      Desc.PS = std::move(SC);
+  }
+
+  for (const auto &Attr : P.Bindings.VertexAttributes) {
+    auto FmtOrErr = toFormat(Attr.Format, Attr.Channels);
+    if (!FmtOrErr)
+      return FmtOrErr.takeError();
+    InputLayoutDesc Layout = {};
+    Layout.Name = Attr.Name;
+    Layout.Fmt = *FmtOrErr;
+    Layout.OffsetInBytes = Attr.Offset;
+    Desc.Metadata.InputLayout.push_back(std::move(Layout));
+  }
+
+  if (!P.Bindings.RTargetBufferPtr)
+    return llvm::createStringError(std::errc::invalid_argument,
+                                   "No render target bound for graphics "
+                                   "pipeline.");
+  auto RTFmtOrErr = toFormat(P.Bindings.RTargetBufferPtr->Format,
+                             P.Bindings.RTargetBufferPtr->Channels);
+  if (!RTFmtOrErr)
+    return RTFmtOrErr.takeError();
+  Desc.Metadata.RTFormats.push_back(*RTFmtOrErr);
+
+  return Desc;
+}
+
 llvm::Expected<std::unique_ptr<Texture>>
 offloadtest::createRenderTargetFromCPUBuffer(Device &Dev,
                                              const CPUBuffer &Buf) {

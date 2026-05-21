@@ -397,14 +397,11 @@ public:
   std::string Name;
   ComPtr<ID3D12RootSignature> RootSig;
   ComPtr<ID3D12PipelineState> PSO;
-  D3D_PRIMITIVE_TOPOLOGY Topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 
-  DXPipelineState(
-      llvm::StringRef Name, ComPtr<ID3D12RootSignature> RootSig,
-      ComPtr<ID3D12PipelineState> PSO,
-      D3D_PRIMITIVE_TOPOLOGY Topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+  DXPipelineState(llvm::StringRef Name, ComPtr<ID3D12RootSignature> RootSig,
+                  ComPtr<ID3D12PipelineState> PSO)
       : offloadtest::PipelineState(GPUAPI::DirectX), Name(Name),
-        RootSig(RootSig), PSO(PSO), Topology(Topology) {}
+        RootSig(RootSig), PSO(PSO) {}
 
   static bool classof(const offloadtest::PipelineState *B) {
     return B->getAPI() == GPUAPI::DirectX;
@@ -712,9 +709,14 @@ class DXRenderEncoder : public offloadtest::RenderEncoder {
                                      "Scissor must be set before drawing.");
 
     const auto &DXPSO = llvm::cast<DXPipelineState>(PSO);
+    if (!DXPSO.Meta)
+      return llvm::createStringError(
+          std::errc::invalid_argument,
+          "drawInstanced called with a non-graphics pipeline state.");
     CB.CmdList->SetGraphicsRootSignature(DXPSO.RootSig.Get());
     CB.CmdList->SetPipelineState(DXPSO.PSO.Get());
-    CB.CmdList->IASetPrimitiveTopology(DXPSO.Topology);
+    CB.CmdList->IASetPrimitiveTopology(
+        getDXPrimitiveTopology(DXPSO.Meta->Topology));
     return llvm::Error::success();
   }
 
@@ -1106,7 +1108,7 @@ public:
   llvm::Expected<std::unique_ptr<PipelineState>>
   createGraphicsPipeline(llvm::StringRef Name, const BindingsDesc &BindingsDesc,
                          const GraphicsPipelineCreateDesc &Desc) override {
-    assert(Desc.RTFormats.size() <= 8);
+    assert(Desc.Metadata.RTFormats.size() <= 8);
     if (!Desc.PS)
       return llvm::createStringError(
           std::errc::invalid_argument,
@@ -1118,8 +1120,8 @@ public:
       return Err;
 
     std::vector<D3D12_INPUT_ELEMENT_DESC> DXInputLayout;
-    DXInputLayout.reserve(Desc.InputLayout.size());
-    for (const InputLayoutDesc &Elem : Desc.InputLayout) {
+    DXInputLayout.reserve(Desc.Metadata.InputLayout.size());
+    for (const InputLayoutDesc &Elem : Desc.Metadata.InputLayout) {
       assert(!Elem.InstanceStepRate &&
              "Instance step rate is currently not supported.");
 
@@ -1154,12 +1156,14 @@ public:
     PSODesc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
     PSODesc.DepthStencilState.StencilEnable = false;
     PSODesc.SampleMask = UINT_MAX;
-    PSODesc.PrimitiveTopologyType = getDXPrimitiveTopologyType(Desc.Topology);
-    PSODesc.NumRenderTargets = static_cast<UINT>(Desc.RTFormats.size());
-    if (Desc.DSFormat)
-      PSODesc.DSVFormat = getDXGIFormat(*Desc.DSFormat);
-    for (size_t I = 0; I < Desc.RTFormats.size(); ++I)
-      PSODesc.RTVFormats[I] = getDXGIFormat(Desc.RTFormats[I]);
+    PSODesc.PrimitiveTopologyType =
+        getDXPrimitiveTopologyType(Desc.Metadata.Topology);
+    PSODesc.NumRenderTargets =
+        static_cast<UINT>(Desc.Metadata.RTFormats.size());
+    if (Desc.Metadata.DSFormat)
+      PSODesc.DSVFormat = getDXGIFormat(*Desc.Metadata.DSFormat);
+    for (size_t I = 0; I < Desc.Metadata.RTFormats.size(); ++I)
+      PSODesc.RTVFormats[I] = getDXGIFormat(Desc.Metadata.RTFormats[I]);
     PSODesc.SampleDesc.Count = 1;
 
     ComPtr<ID3D12PipelineState> PSO;
@@ -1168,8 +1172,9 @@ public:
             "Failed to create graphics PSO."))
       return Err;
 
-    return std::make_unique<DXPipelineState>(
-        Name, RootSig, PSO, getDXPrimitiveTopology(Desc.Topology));
+    auto State = std::make_unique<DXPipelineState>(Name, RootSig, PSO);
+    State->Meta = Desc.Metadata;
+    return State;
   }
 
   llvm::Expected<std::unique_ptr<offloadtest::Fence>>
@@ -2201,7 +2206,8 @@ public:
     Encoder.setScissor(Scissor);
 
     if (IS.VB)
-      Encoder.setVertexBuffer(0, IS.VB.get(), 0, P.Bindings.getVertexStride());
+      Encoder.setVertexBuffer(0, IS.VB.get(), 0,
+                              IS.Pipeline->Meta->getVertexStride());
 
     if (auto Err = Encoder.drawInstanced(*IS.Pipeline.get(), P.getVertexCount(),
                                          /*InstanceCount=*/1))
@@ -2334,40 +2340,12 @@ public:
         return Err;
       llvm::outs() << "Depth stencil created.\n";
 
-      GraphicsPipelineCreateDesc PipelineDesc = {};
-      PipelineDesc.Topology = P.Bindings.Topology;
-      PipelineDesc.DSFormat = Format::D32FloatS8Uint;
-      for (auto &Shader : P.Shaders) {
-        ShaderContainer SC = {};
-        SC.EntryPoint = Shader.Entry;
-        SC.Shader = Shader.Shader.get();
-        if (Shader.Stage == Stages::Vertex)
-          PipelineDesc.VS = std::move(SC);
-        else if (Shader.Stage == Stages::Pixel)
-          PipelineDesc.PS = std::move(SC);
-      }
-
-      // Create the input layout based on the vertex attributes.
-      for (auto &Attr : P.Bindings.VertexAttributes) {
-        auto FormatOrErr = toFormat(Attr.Format, Attr.Channels);
-        if (!FormatOrErr)
-          return FormatOrErr.takeError();
-
-        InputLayoutDesc Layout = {};
-        Layout.Name = Attr.Name;
-        Layout.Fmt = *FormatOrErr;
-        Layout.OffsetInBytes = Attr.Offset;
-        PipelineDesc.InputLayout.push_back(Layout);
-      }
-
-      auto FormatOrErr = toFormat(P.Bindings.RTargetBufferPtr->Format,
-                                  P.Bindings.RTargetBufferPtr->Channels);
-      if (!FormatOrErr)
-        return FormatOrErr.takeError();
-      PipelineDesc.RTFormats.push_back(*FormatOrErr);
+      auto PipelineDescOrErr = buildGraphicsPipelineCreateDesc(P);
+      if (!PipelineDescOrErr)
+        return PipelineDescOrErr.takeError();
 
       auto PipelineStateOrErr = createGraphicsPipeline(
-          "Graphics Pipeline State", BindingsDesc, PipelineDesc);
+          "Graphics Pipeline State", BindingsDesc, *PipelineDescOrErr);
       if (!PipelineStateOrErr)
         return PipelineStateOrErr.takeError();
       State.Pipeline = std::move(*PipelineStateOrErr);
@@ -2375,13 +2353,14 @@ public:
 
       // Begin a render pass: bind RT/DSV and clear depth-stencil. Color
       // load action is Load — the existing inline code didn't clear color.
+      const GraphicsPipelineMetadata &Meta = *State.Pipeline->Meta;
       ColorAttachmentFormatDesc ColorAttachment = {};
-      ColorAttachment.Fmt = State.RenderTarget->getDesc().Fmt;
+      ColorAttachment.Fmt = Meta.RTFormats[0];
       ColorAttachment.Load = LoadAction::Load;
       ColorAttachment.Store = StoreAction::Store;
 
       DepthStencilAttachmentFormatDesc DSAttachment = {};
-      DSAttachment.Fmt = State.DepthStencil->getDesc().Fmt;
+      DSAttachment.Fmt = *Meta.DSFormat;
       DSAttachment.DepthLoad = LoadAction::Clear;
       DSAttachment.DepthStore = StoreAction::Store;
       DSAttachment.StencilLoad = LoadAction::DontCare;
