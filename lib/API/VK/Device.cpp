@@ -1444,7 +1444,8 @@ public:
           "Graphics pipeline requires a pixel shader on this backend.");
     const ShaderContainer &VS = Desc.VS;
     const ShaderContainer &PS = *Desc.PS;
-    const llvm::ArrayRef<InputLayoutDesc> InputLayout = Desc.Metadata.InputLayout;
+    const llvm::ArrayRef<InputLayoutDesc> InputLayout =
+        Desc.Metadata.InputLayout;
     const llvm::ArrayRef<Format> RTFormats = Desc.Metadata.RTFormats;
     const std::optional<Format> DSFormat = Desc.Metadata.DSFormat;
 

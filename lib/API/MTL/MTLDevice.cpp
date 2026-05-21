@@ -1570,7 +1570,8 @@ public:
           "Metal: Only TriangleList topology is currently supported.");
     const ShaderContainer &VS = Desc.VS;
     const ShaderContainer &PS = *Desc.PS;
-    const llvm::ArrayRef<InputLayoutDesc> InputLayout = Desc.Metadata.InputLayout;
+    const llvm::ArrayRef<InputLayoutDesc> InputLayout =
+        Desc.Metadata.InputLayout;
     const llvm::ArrayRef<Format> RTFormats = Desc.Metadata.RTFormats;
     const std::optional<Format> DSFormat = Desc.Metadata.DSFormat;
 
@@ -1725,9 +1726,9 @@ public:
     MTL::DepthStencilState *DSState = Device->newDepthStencilState(DSDesc);
     DSDesc->release();
 
-    auto State = std::make_unique<MTLPipelineState>(
-        Name, std::move(RootSig), std::move(ArgBuffer), PSO, DSState,
-        MTL::CullModeNone);
+    auto State = std::make_unique<MTLPipelineState>(Name, std::move(RootSig),
+                                                    std::move(ArgBuffer), PSO,
+                                                    DSState, MTL::CullModeNone);
     State->Meta = Desc.Metadata;
     return State;
   }
