@@ -389,6 +389,7 @@ struct IOBindings {
 
   std::string RenderTarget;
   CPUBuffer *RTargetBufferPtr = nullptr;
+  PrimitiveTopology Topology = PrimitiveTopology::TriangleList;
 
   uint32_t getVertexStride() const {
     uint32_t Stride = 0;
@@ -713,6 +714,15 @@ template <> struct ScalarEnumerationTraits<offloadtest::Stages> {
     ENUM_CASE(Compute);
     ENUM_CASE(Vertex);
     ENUM_CASE(Pixel);
+#undef ENUM_CASE
+  }
+};
+
+template <> struct ScalarEnumerationTraits<offloadtest::PrimitiveTopology> {
+  static void enumeration(IO &I, offloadtest::PrimitiveTopology &V) {
+#define ENUM_CASE(Val) I.enumCase(V, #Val, offloadtest::PrimitiveTopology::Val)
+    ENUM_CASE(TriangleList);
+    ENUM_CASE(PointList);
 #undef ENUM_CASE
   }
 };
