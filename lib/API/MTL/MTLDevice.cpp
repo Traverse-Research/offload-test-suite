@@ -703,6 +703,10 @@ class MTLComputeEncoder : public offloadtest::ComputeEncoder {
   /// the next encoder transition (via endEncodingImpl).
   MTL::AccelerationStructureCommandEncoder *ASEnc = nullptr;
 
+  /// Resource descriptor heap bound to this encoder, if any. Remembered so a
+  /// ray dispatch can point IRDispatchRaysArgument::ResDescHeap at it.
+  MTLDescriptorHeap *BoundResourceHeap = nullptr;
+
   /// Accumulated barrier scope from commands recorded since the last barrier.
   MTL::BarrierScope PendingScope = MTL::BarrierScope(0);
 
@@ -767,6 +771,16 @@ public:
     if (auto Err = ensureComputeEncoder())
       return Err;
     return ComputeEnc;
+  }
+
+  /// Bind \p Heap as the global resource descriptor heap and remember it so a
+  /// subsequent dispatchRays can reference it from IRDispatchRaysArgument.
+  llvm::Error bindResourceHeap(MTLDescriptorHeap &Heap) {
+    if (auto Err = ensureComputeEncoder())
+      return Err;
+    Heap.bind(ComputeEnc);
+    BoundResourceHeap = &Heap;
+    return llvm::Error::success();
   }
 
   MTL::CommandEncoder *getActiveEncoder() const {
@@ -937,40 +951,16 @@ public:
   // MTL::Device handle (used to allocate scratch and instance buffers).
   llvm::Error batchBuildAS(llvm::ArrayRef<ASBuildItem> Items) override;
 
-  // Dispatch threads using a raygen compute kernel synthesized by the
-  // irconverter. All bindings (descriptor heap, top-level argument buffer,
-  // IRDispatchRaysArgument at slot 3, visible/intersection function tables,
-  // and the SBT buffer) must already be set on the active compute encoder by
-  // the caller — this method only binds the pipeline state and issues the
-  // dispatch.
-  llvm::Error dispatchRays(const PipelineState &PSO, const ShaderBindingTable &,
-                           uint32_t Width, uint32_t Height,
-                           uint32_t Depth) override {
-    if (!llvm::isa<MTLRayTracingPipelineState>(&PSO))
-      return llvm::createStringError(
-          std::errc::invalid_argument,
-          "dispatchRays requires a RayTracing PipelineState.");
-    const auto &RTPSO = llvm::cast<MTLRayTracingPipelineState>(PSO);
-    if (!RTPSO.ComputePipeline)
-      return llvm::createStringError(
-          std::errc::invalid_argument,
-          "RayTracing PipelineState has no compute pipeline state.");
-    if (auto Err = ensureComputeEncoder())
-      return Err;
-    flushBarrier();
-    insertDebugSignpost(
-        llvm::formatv("DispatchRays [{0},{1},{2}]", Width, Height, Depth)
-            .str());
-    ComputeEnc->setComputePipelineState(RTPSO.ComputePipeline);
-
-    // DispatchRays(W, H, D) launches W*H*D rays; tid in the irconverter raygen
-    // kernel is the per-ray index. Pass grid as raw (W, H, D) and let Metal
-    // ceil-divide by ThreadsPerGroup to compute threadgroup count.
-    const MTL::Size GridSize(Width, Height, Depth);
-    ComputeEnc->dispatchThreads(GridSize, RTPSO.ThreadsPerGroup);
-    addBarrierScope(MTL::BarrierScopeBuffers | MTL::BarrierScopeTextures);
-    return llvm::Error::success();
-  }
+  // Issue a ray dispatch: synthesizes the per-dispatch IRDispatchRaysArgument
+  // (SBT region addresses, GRS + resource-heap pointers, visible/intersection
+  // function-table IDs), binds it at kIRRayDispatchArgumentsBindPoint, and
+  // dispatches the irconverter raygen compute kernel. The caller must have
+  // already bound the descriptor heap and top-level argument buffer (the
+  // compute-dispatch path does the same). Defined out-of-line below —
+  // allocating the argument buffer needs MTLDevice's full type.
+  llvm::Error dispatchRays(const PipelineState &PSO,
+                           const ShaderBindingTable &SBT, uint32_t Width,
+                           uint32_t Height, uint32_t Depth) override;
 
   /// Lazily transition into an AccelerationStructureCommandEncoder; mirrors
   /// the existing compute↔blit lazy switch.
@@ -1600,7 +1590,8 @@ public:
     const auto &PS = llvm::cast<MTLPipelineState>(IS.Pipeline.get());
     MTLGPUDescriptorHandle Handle = {};
     if (DescHeap) {
-      DescHeap->bind(NativeEncoder);
+      if (auto Err = Encoder.bindResourceHeap(*DescHeap))
+        return Err;
       Handle = DescHeap->getGPUDescriptorHandleForHeapStart();
     }
 
@@ -1611,89 +1602,20 @@ public:
 
     PS->ArgBuffer->bind(NativeEncoder);
 
-    if (auto Err = Encoder.dispatch(*IS.Pipeline.get(),
+    // Metal compiles raygen as a compute kernel, so a ray-tracing pipeline
+    // dispatches through the same compute encoder as a plain compute shader.
+    if (P.isRayTracing()) {
+      if (auto Err =
+              Encoder.dispatchRays(*IS.Pipeline.get(), *IS.SBT.get(),
+                                   P.DispatchParameters.DispatchGroupCount[0],
+                                   P.DispatchParameters.DispatchGroupCount[1],
+                                   P.DispatchParameters.DispatchGroupCount[2]))
+        return Err;
+    } else if (auto Err =
+                   Encoder.dispatch(*IS.Pipeline.get(),
                                     P.DispatchParameters.DispatchGroupCount[0],
                                     P.DispatchParameters.DispatchGroupCount[1],
                                     P.DispatchParameters.DispatchGroupCount[2]))
-      return Err;
-    Encoder.endEncoding();
-    return llvm::Error::success();
-  }
-
-  llvm::Error
-  createRayTracingCommands(Pipeline &P, SharedInvocationState &IS,
-                           const std::unique_ptr<MTLDescriptorHeap> &DescHeap) {
-    auto EncoderOrErr = IS.CB->createComputeEncoder();
-    if (!EncoderOrErr)
-      return EncoderOrErr.takeError();
-    auto &Encoder = llvm::cast<MTLComputeEncoder>(*EncoderOrErr.get());
-    auto NativeOrErr = Encoder.getNative();
-    if (!NativeOrErr)
-      return NativeOrErr.takeError();
-    MTL::ComputeCommandEncoder *NativeEncoder = *NativeOrErr;
-
-    const auto &RTPSO =
-        llvm::cast<MTLRayTracingPipelineState>(*IS.Pipeline.get());
-    const auto &SBT = llvm::cast<MTLShaderBindingTable>(*IS.SBT.get());
-
-    // Bind the global descriptor heap + top-level argument buffer the same
-    // way the compute path does; the raygen kernel and any visible-function
-    // callees consume them at the same slots (kIRDescriptorHeapBindPoint and
-    // kIRArgumentBufferBindPoint).
-    MTLGPUDescriptorHandle Handle = {};
-    if (DescHeap) {
-      DescHeap->bind(NativeEncoder);
-      Handle = DescHeap->getGPUDescriptorHandleForHeapStart();
-    }
-    for (uint32_t Idx = 0u; Idx < P.Sets.size(); ++Idx) {
-      RTPSO.ArgBuffer->setRootDescriptorTable(Idx, Handle);
-      Handle.addOffset(P.Sets[Idx].Resources.size());
-    }
-    RTPSO.ArgBuffer->bind(NativeEncoder);
-
-    // Populate the per-dispatch IRDispatchRaysArgument: SBT region addresses
-    // (RayGen / Miss / HitGroup / Callable), GPU pointers to the global
-    // root-signature argument buffer + descriptor heaps, plus resource IDs
-    // for the visible / intersection function tables. The raygen kernel
-    // reads this struct from the buffer bound at kIRRayDispatchArgumentsBind-
-    // Point and any visible-function callees inherit it through the same
-    // pointer.
-    IRDispatchRaysArgument Args{};
-    Args.DispatchRaysDesc.RayGenerationShaderRecord = SBT.RayGenRegion;
-    Args.DispatchRaysDesc.MissShaderTable = SBT.MissRegion;
-    Args.DispatchRaysDesc.HitGroupTable = SBT.HitGroupRegion;
-    Args.DispatchRaysDesc.CallableShaderTable = SBT.CallableRegion;
-    Args.DispatchRaysDesc.Width = P.DispatchParameters.DispatchGroupCount[0];
-    Args.DispatchRaysDesc.Height = P.DispatchParameters.DispatchGroupCount[1];
-    Args.DispatchRaysDesc.Depth = P.DispatchParameters.DispatchGroupCount[2];
-    Args.GRS = RTPSO.ArgBuffer->getGPUAddress();
-    Args.ResDescHeap =
-        DescHeap ? DescHeap->getGPUDescriptorHandleForHeapStart().Ptr : 0;
-    Args.SmpDescHeap = 0;
-    Args.VisibleFunctionTable =
-        RTPSO.VFT ? RTPSO.VFT->gpuResourceID() : MTL::ResourceID{0};
-    Args.IntersectionFunctionTable =
-        RTPSO.IFT ? RTPSO.IFT->gpuResourceID() : MTL::ResourceID{0};
-    Args.IntersectionFunctionTables = 0;
-
-    const BufferCreateDesc ArgsBufDesc = BufferCreateDesc::uploadBuffer();
-    auto ArgsBufOrErr = offloadtest::createBufferWithData(
-        *this, "MTL Dispatch Rays Arguments", ArgsBufDesc, &Args,
-        sizeof(IRDispatchRaysArgument), nullptr, nullptr);
-    if (!ArgsBufOrErr)
-      return ArgsBufOrErr.takeError();
-
-    auto *MTLArgsBuf = llvm::cast<MTLBuffer>(ArgsBufOrErr->get());
-    IS.KeepAliveBuffers.push_back(std::move(*ArgsBufOrErr));
-
-    NativeEncoder->setBuffer(MTLArgsBuf->getBufferPtr(), 0,
-                             kIRRayDispatchArgumentsBindPoint);
-
-    if (auto Err =
-            Encoder.dispatchRays(*IS.Pipeline.get(), *IS.SBT.get(),
-                                 P.DispatchParameters.DispatchGroupCount[0],
-                                 P.DispatchParameters.DispatchGroupCount[1],
-                                 P.DispatchParameters.DispatchGroupCount[2]))
       return Err;
     Encoder.endEncoding();
     return llvm::Error::success();
@@ -2897,7 +2819,9 @@ public:
       IS.SBT = std::move(*SBTOrErr);
       llvm::outs() << "Shader Binding Table created.\n";
 
-      if (auto Err = createRayTracingCommands(P, IS, DescHeap))
+      // Metal lowers raygen to a compute kernel, so ray tracing records its
+      // dispatch through the shared compute-command path.
+      if (auto Err = createComputeCommands(P, IS, DescHeap))
         return Err;
     }
 
@@ -3153,6 +3077,76 @@ llvm::Error MTLComputeEncoder::batchBuildAS(llvm::ArrayRef<ASBuildItem> Items) {
     Desc->release();
   }
 
+  return llvm::Error::success();
+}
+
+llvm::Error MTLComputeEncoder::dispatchRays(const PipelineState &PSO,
+                                            const ShaderBindingTable &SBT,
+                                            uint32_t Width, uint32_t Height,
+                                            uint32_t Depth) {
+  if (!llvm::isa<MTLRayTracingPipelineState>(&PSO))
+    return llvm::createStringError(
+        std::errc::invalid_argument,
+        "dispatchRays requires a RayTracing PipelineState.");
+  if (!llvm::isa<MTLShaderBindingTable>(&SBT))
+    return llvm::createStringError(
+        std::errc::invalid_argument,
+        "dispatchRays requires a Metal ShaderBindingTable.");
+  const auto &RTPSO = llvm::cast<MTLRayTracingPipelineState>(PSO);
+  const auto &MTLSBT = llvm::cast<MTLShaderBindingTable>(SBT);
+  if (!RTPSO.ComputePipeline)
+    return llvm::createStringError(
+        std::errc::invalid_argument,
+        "RayTracing PipelineState has no compute pipeline state.");
+  if (auto Err = ensureComputeEncoder())
+    return Err;
+  flushBarrier();
+  insertDebugSignpost(
+      llvm::formatv("DispatchRays [{0},{1},{2}]", Width, Height, Depth).str());
+
+  // Populate the per-dispatch IRDispatchRaysArgument: SBT region addresses
+  // (RayGen / Miss / HitGroup / Callable), GPU pointers to the global
+  // root-signature argument buffer + descriptor heaps, plus resource IDs for
+  // the visible / intersection function tables. The raygen kernel reads this
+  // struct from the buffer bound at kIRRayDispatchArgumentsBindPoint and any
+  // visible-function callees inherit it through the same pointer.
+  IRDispatchRaysArgument Args{};
+  Args.DispatchRaysDesc.RayGenerationShaderRecord = MTLSBT.RayGenRegion;
+  Args.DispatchRaysDesc.MissShaderTable = MTLSBT.MissRegion;
+  Args.DispatchRaysDesc.HitGroupTable = MTLSBT.HitGroupRegion;
+  Args.DispatchRaysDesc.CallableShaderTable = MTLSBT.CallableRegion;
+  Args.DispatchRaysDesc.Width = Width;
+  Args.DispatchRaysDesc.Height = Height;
+  Args.DispatchRaysDesc.Depth = Depth;
+  Args.GRS = RTPSO.ArgBuffer->getGPUAddress();
+  Args.ResDescHeap =
+      BoundResourceHeap
+          ? BoundResourceHeap->getGPUDescriptorHandleForHeapStart().Ptr
+          : 0;
+  Args.SmpDescHeap = 0;
+  Args.VisibleFunctionTable =
+      RTPSO.VFT ? RTPSO.VFT->gpuResourceID() : MTL::ResourceID{0};
+  Args.IntersectionFunctionTable =
+      RTPSO.IFT ? RTPSO.IFT->gpuResourceID() : MTL::ResourceID{0};
+  Args.IntersectionFunctionTables = 0;
+
+  auto ArgsBufOrErr = offloadtest::createBufferWithData(
+      *CB->Dev, "MTL Dispatch Rays Arguments", BufferCreateDesc::uploadBuffer(),
+      &Args, sizeof(IRDispatchRaysArgument), nullptr, nullptr);
+  if (!ArgsBufOrErr)
+    return ArgsBufOrErr.takeError();
+  auto *MTLArgsBuf = llvm::cast<MTLBuffer>(ArgsBufOrErr->get());
+  CB->KeepAliveOwned.push_back(std::move(*ArgsBufOrErr));
+  ComputeEnc->setBuffer(MTLArgsBuf->getBufferPtr(), 0,
+                        kIRRayDispatchArgumentsBindPoint);
+
+  ComputeEnc->setComputePipelineState(RTPSO.ComputePipeline);
+  // DispatchRays(W, H, D) launches W*H*D rays; tid in the irconverter raygen
+  // kernel is the per-ray index. Pass grid as raw (W, H, D) and let Metal
+  // ceil-divide by ThreadsPerGroup to compute threadgroup count.
+  const MTL::Size GridSize(Width, Height, Depth);
+  ComputeEnc->dispatchThreads(GridSize, RTPSO.ThreadsPerGroup);
+  addBarrierScope(MTL::BarrierScopeBuffers | MTL::BarrierScopeTextures);
   return llvm::Error::success();
 }
 
