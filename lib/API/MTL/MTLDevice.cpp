@@ -2852,6 +2852,8 @@ public:
   }
 
   llvm::Error executeProgram(Pipeline &P) override {
+    return executeUnitTest(*this, P);
+#if 0
     auto DescriptorPoolOrErr = createDescriptorPool();
     if (!DescriptorPoolOrErr)
       return DescriptorPoolOrErr.takeError();
@@ -3062,6 +3064,7 @@ public:
       return Err;
     llvm::outs() << "Read data back.\n";
     return llvm::Error::success();
+#endif
   }
 
   virtual ~MTLDevice() {};
